@@ -402,11 +402,22 @@ class JEPA(nn.Module):
         pred_emb = pred_emb[..., -T:, :]
         goal_emb = goal_emb[..., -T:, :].expand_as(pred_emb)
         weights = info_dict.get("traj_weights")
+        velocity_weight = float(info_dict.get("velocity_weight", 0.0))
         diff = (pred_emb - goal_emb.detach()).pow(2).mean(dim=-1)  # (B, S, T)
         if weights is not None:
             w = weights[:T].to(diff)
             diff = diff * w
-        return diff.mean(dim=-1)
+        cost = diff.mean(dim=-1)
+
+        if velocity_weight > 0.0 and T > 1:
+            pred_vel = pred_emb[..., 1:, :] - pred_emb[..., :-1, :]
+            goal_vel = goal_emb[..., 1:, :] - goal_emb[..., :-1, :]
+            vel_diff = (pred_vel - goal_vel.detach()).pow(2).mean(dim=-1)  # (B, S, T - 1)
+            if weights is not None:
+                vel_w = weights[1:T].to(vel_diff)
+                vel_diff = vel_diff * vel_w
+            cost = cost + velocity_weight * vel_diff.mean(dim=-1)
+        return cost
 
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:
         """Compute cost of action candidates given an info dict with goal trajectory + initial state."""
@@ -484,11 +495,16 @@ class JEPA(nn.Module):
         future_actions: torch.Tensor,
         goal_latents: torch.Tensor,
         weights: torch.Tensor | None = None,
+        velocity_weight: float = 0.0,
         history_size: int | None = None,
     ) -> torch.Tensor:
         """Rollout + trajectory cost in one call. Returns (B, S)."""
         pred = self.rollout_latents(history_pixels, history_actions, future_actions, history_size)
-        info = {"predicted_emb": pred, "goal_emb": goal_latents}
+        info = {
+            "predicted_emb": pred,
+            "goal_emb": goal_latents,
+            "velocity_weight": velocity_weight,
+        }
         if weights is not None:
             info["traj_weights"] = weights
         return self.criterion(info)

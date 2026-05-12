@@ -1,129 +1,251 @@
-"""Single-script pipeline for dm_control walker/walk:
-    1. Generate Oracle-CEM demonstrations (pixels + actions + a goal trajectory).
-    2. Train LeWM (`model.py`) on those demonstrations.
-    3. Evaluate LeWM-CEM in pixel space — plan by tracking the latent
-       trajectory of an Oracle-CEM demonstration (no oracle simulator at
-       deployment), and render a video.
+"""Clean reference-style LeWM pipeline for dm_control walker/walk.
 
-Usage:
+Run:
     uv run python walker_walk.py
-    uv run python walker_walk.py --skip-train  # if a checkpoint already exists
-    uv run python walker_walk.py --no-eval     # data gen + train only
 
-Outputs (default): outputs/walker_walk/
-    data/episode_*.npz        per-episode raw rollouts
-    data/goal_trajectory.npz  the goal demonstration used at eval time
-    ckpt/lewm.pt              trained LeWM weights
-    eval_cam0.mp4             LeWM-CEM evaluation video
-    metrics.json              eval metrics
+The script is intentionally split into reusable stages:
+1. Build a static dataset under DATASET_DIR if it does not already exist.
+2. Train LeWM from that dataset with one-step prediction + SIGReg.
+3. Evaluate pure LeWM-CEM against the clean goal trajectory.
+
+No MuJoCo oracle, reward, or intervention is used during training or eval.
 """
 from __future__ import annotations
 
-import argparse
 import json
+import multiprocessing as mp
 import os
-from dataclasses import dataclass, field, asdict
+import shutil
+import time
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
-from typing import List, Tuple
+from queue import Empty
+from typing import Iterable, List, Tuple
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
+from dm_control import suite
 from tqdm import tqdm
 
-from dm_control import suite
-import imageio.v2 as imageio
-
-from model import SIGReg, build_lewm, lewm_loss
+from model import SIGReg, build_lewm
 
 
 # ---------------------------------------------------------------------------
-# Configuration.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Config:
-    seed: int = 42
-    out_dir: str = "outputs/walker_walk"
-
-    # ----- Oracle CEM data generation -----
-    num_demo_episodes: int = 8
-    episode_steps: int = 400  # 10s of walker/walk control_timestep=0.025
-    plan_horizon: int = 20
-    cem_samples: int = 96
-    cem_topk: int = 12
-    cem_iters: int = 3
-    cem_init_std: float = 0.55
-    cem_min_std: float = 0.06
-    cem_momentum: float = 0.15
-    reward_gamma: float = 0.98
-    target_speed: float = 1.2
-    progress_bonus: float = 0.75
-    speed_tracking_bonus: float = 0.12
-    overspeed_penalty: float = 0.35
-    posture_penalty: float = 1.2
-    action_penalty: float = 0.01
-    action_smoothness_penalty: float = 0.015
-
-    # ----- LeWM training -----
-    image_size: int = 224
-    patch_size: int = 14
-    encoder_scale: str = "tiny"
-    embed_dim: int = 192
-    history_size: int = 3
-    num_preds: int = 1
-    frameskip: int = 1  # we already capture every env step.
-    predictor_depth: int = 6
-    predictor_heads: int = 16
-    predictor_dim_head: int = 64
-    predictor_mlp_dim: int = 2048
-    predictor_dropout: float = 0.1
-    sigreg_weight: float = 0.09
-    sigreg_knots: int = 17
-    sigreg_num_proj: int = 1024
-    train_batch_size: int = 32
-    train_steps: int = 2000
-    lr: float = 5e-5
-    weight_decay: float = 1e-3
-    grad_clip: float = 1.0
-    log_every: int = 50
-
-    # ----- LeWM-CEM evaluation -----
-    eval_steps: int = 400
-    eval_plan_horizon: int = 12
-    eval_cem_samples: int = 256
-    eval_cem_topk: int = 32
-    eval_cem_iters: int = 3
-    eval_cem_init_std: float = 0.4
-    eval_cem_min_std: float = 0.05
-    eval_cem_momentum: float = 0.15
-    eval_traj_weight_gamma: float = 0.9  # weights[t] = gamma**t (heavier near-term)
-    goal_lookahead: int = 12  # how many future goal frames the planner targets
-
-    # ----- Video -----
-    video_camera_id: int = 0
-    video_width: int = 640
-    video_height: int = 480
-    video_fps: int = 40
-
-    # NB: data tensors (frames at training resolution) are stored in fp16 to
-    # keep disk usage modest.
-
-    def out_path(self) -> Path:
-        return Path(self.out_dir)
-
-
-# ---------------------------------------------------------------------------
-# Oracle CEM (adapted from references/oracle_cem_walker_walk.py).
+# Experiment paths.
 # ---------------------------------------------------------------------------
 
 
 DOMAIN = "walker"
 TASK = "walk"
+SEED = 42
+
+DATASET_DIR = Path("datasets/walker_walk")
+OUT_DIR = Path("outputs/walker_walk")
+CKPT_DIR = OUT_DIR / "ckpt"
+TRAIN_LOG_PATH = OUT_DIR / "train_log.jsonl"
+EVAL_TRACE_PATH = OUT_DIR / "eval_trace.jsonl"
+DIAGNOSTICS_PATH = OUT_DIR / "diagnostics.json"
+DATASET_VERSION = 5
+
+
+# ---------------------------------------------------------------------------
+# Offline dataset generation.
+# ---------------------------------------------------------------------------
+
+
+IMAGE_SIZE = 112
+DATASET_CAMERA_ID = 0
+VIDEO_CAMERA_ID = 0
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 480
+VIDEO_FPS = 40
+
+CLEAN_DEMO_EPISODES = 4
+PERTURBED_DEMO_EPISODES = 2
+DATASET_EPISODE_STEPS = 400
+DATASET_WORKERS = min(8, os.cpu_count() or 1)
+DATASET_MP_START_METHOD = "forkserver"
+MAX_ATTEMPTS_PER_SUCCESS = 6
+CLEAN_MIN_RETURN = 250.0
+CLEAN_MIN_MEAN_HEIGHT = 1.0
+QUALITY_TAIL_STEPS = 80
+TAIL_MIN_REWARD = 0.85
+TAIL_MIN_HEIGHT = 1.05
+TAIL_MIN_UPRIGHT = 0.85
+TAIL_MIN_VELOCITY = 0.5
+RECOVERY_MAX_MIN_HEIGHT = 0.9
+RECOVERY_MAX_MIN_UPRIGHT = 0.5
+
+ORACLE_PLAN_HORIZON = 20
+ORACLE_CEM_SAMPLES = 128
+ORACLE_CEM_TOPK = 16
+ORACLE_CEM_ITERS = 4
+ORACLE_CEM_INIT_STD = 0.55
+ORACLE_CEM_MIN_STD = 0.06
+ORACLE_CEM_MOMENTUM = 0.15
+ORACLE_REWARD_GAMMA = 0.98
+
+TARGET_SPEED = 1.2
+PROGRESS_BONUS = 0.75
+SPEED_TRACKING_BONUS = 0.12
+OVERSPEED_PENALTY = 0.35
+POSTURE_PENALTY = 1.2
+ACTION_PENALTY = 0.01
+ACTION_SMOOTHNESS_PENALTY = 0.015
+
+PERTURB_SCHEDULE: list[tuple[int, int, float]] = [
+    (50, 12, 0.15),
+    (130, 12, 0.25),
+    (220, 14, 0.35),
+    (310, 14, 0.50),
+]
+OU_RHO = float(np.exp(-0.025 / 0.15))
+
+RECOVERY_STEPS = 260
+RECOVERY_REPEATS = 2
+RECOVERY_POSES: list[dict[str, float | str]] = [
+    {
+        "name": "forward_prone",
+        "rootz": -0.72,
+        "rooty": 1.55,
+        "qvel_rootx": 7.5,
+        "qvel_rootz": -2.0,
+        "qvel_rooty": 8.0,
+    },
+    {
+        "name": "backward_supine",
+        "rootz": -0.72,
+        "rooty": -1.55,
+        "qvel_rootx": -7.5,
+        "qvel_rootz": -2.0,
+        "qvel_rooty": -8.0,
+    },
+    {
+        "name": "upward_flip",
+        "rootz": -0.35,
+        "rooty": 3.0,
+        "qvel_rootx": 2.0,
+        "qvel_rootz": 7.0,
+        "qvel_rooty": 10.0,
+    },
+    {
+        "name": "downward_crumple",
+        "rootz": -0.92,
+        "rooty": 2.65,
+        "qvel_rootx": -2.0,
+        "qvel_rootz": -8.0,
+        "qvel_rooty": -10.0,
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# LeWM training.
+# ---------------------------------------------------------------------------
+
+
+HISTORY_SIZE = 4
+NUM_PREDS = 1
+FRAMESKIP = 1
+PATCH_SIZE = 14
+ENCODER_SCALE = "tiny"
+EMBED_DIM = 192
+
+PREDICTOR_DEPTH = 6
+PREDICTOR_HEADS = 16
+PREDICTOR_DIM_HEAD = 64
+PREDICTOR_MLP_DIM = 2048
+PREDICTOR_DROPOUT = 0.1
+
+SIGREG_WEIGHT = 0.09
+SIGREG_KNOTS = 17
+SIGREG_NUM_PROJ = 1024
+TRAIN_BATCH_SIZE = 64
+TRAIN_STEPS = 7000
+TRAIN_NUM_WORKERS = 2
+LR = 5e-5
+WEIGHT_DECAY = 1e-3
+GRAD_CLIP = 1.0
+LOG_EVERY = 50
+TRAIN_ROLLOUT_STEPS = 6
+ROLLOUT_LOSS_WEIGHT = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Pure LeWM-CEM eval.
+# ---------------------------------------------------------------------------
+
+
+EVAL_STEPS = 400
+EVAL_SEED = SEED
+EVAL_BOOTSTRAP_STEPS = HISTORY_SIZE - 1
+ACTION_BLOCK = 1
+PLAN_BLOCKS = 12
+PLAN_HORIZON = ACTION_BLOCK * PLAN_BLOCKS
+EVAL_CEM_SAMPLES = 128
+EVAL_CEM_TOPK = 16
+EVAL_CEM_ITERS = 3
+EVAL_CEM_INIT_STD = 0.002
+EVAL_CEM_MIN_STD = 0.0005
+EVAL_CEM_MOMENTUM = 0.15
+
+GOAL_ORBIT_START = 40
+PHASE_SEARCH_WINDOW = 18
+PHASE_MIN_STEP = 1
+PHASE_MAX_STEP = 4
+TRAJ_DISCOUNT = 0.92
+LATENT_VELOCITY_WEIGHT = 0.5
+ACTION_PRIOR_WEIGHT = 1000.0
+ACTION_SMOOTHNESS_WEIGHT = 0.05
+ACTION_ENERGY_WEIGHT = 0.002
+FAR_CEM_EXTRA_STD = 0.05
+ORBIT_BLEND_SIGMA_MULT = 8.0
+ORBIT_BLEND_SIGMA_MIN = 0.025
+ORBIT_BLEND_SIGMA_MAX = 0.35
+PHASE_RELOCK_RHO = -1.0
+RETURN_TERMINAL_WEIGHT = 0.75
+
+
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+
+
+def hparams() -> dict:
+    simple = (str, int, float, bool, type(None))
+    out = {}
+    for key, value in globals().items():
+        if not key.isupper():
+            continue
+        if isinstance(value, Path):
+            out[key] = str(value)
+        elif isinstance(value, simple):
+            out[key] = value
+        elif isinstance(value, list):
+            out[key] = value
+    return out
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Environment, rendering, and oracle CEM.
+# ---------------------------------------------------------------------------
 
 
 def make_env(seed: int):
@@ -143,16 +265,23 @@ def action_bounds(env) -> Tuple[np.ndarray, np.ndarray]:
     )
 
 
-def discounted_sum(rewards: List[float], gamma: float) -> float:
-    total = 0.0
-    discount = 1.0
-    for r in rewards:
-        total += discount * float(r)
-        discount *= gamma
-    return total
+def render_dataset_frame(env) -> np.ndarray:
+    return env.physics.render(
+        height=IMAGE_SIZE,
+        width=IMAGE_SIZE,
+        camera_id=DATASET_CAMERA_ID,
+    ).astype(np.uint8)
 
 
-def diagnostics(env) -> dict:
+def render_video_frame(env) -> np.ndarray:
+    return env.physics.render(
+        height=VIDEO_HEIGHT,
+        width=VIDEO_WIDTH,
+        camera_id=VIDEO_CAMERA_ID,
+    ).astype(np.uint8)
+
+
+def diagnostics(env) -> dict[str, float]:
     out = {
         "torso_height": float("nan"),
         "torso_upright": float("nan"),
@@ -169,8 +298,32 @@ def diagnostics(env) -> dict:
     return out
 
 
-def _score_candidate(
-    cfg: Config,
+def discounted_sum(rewards: Iterable[float], gamma: float) -> float:
+    total = 0.0
+    discount = 1.0
+    for reward in rewards:
+        total += discount * float(reward)
+        discount *= gamma
+    return float(total)
+
+
+def perturb_sigma(step: int) -> float:
+    for start, length, sigma in PERTURB_SCHEDULE:
+        if start <= step < start + length:
+            return sigma
+    return 0.0
+
+
+def burst_starts(step: int) -> bool:
+    return any(step == start for start, _, _ in PERTURB_SCHEDULE)
+
+
+def emit_progress(progress_queue, progress_id: int | None, postfix: dict) -> None:
+    if progress_queue is not None and progress_id is not None:
+        progress_queue.put((int(progress_id), 1, postfix))
+
+
+def score_oracle_candidate(
     oracle_env,
     state0: np.ndarray,
     actions: np.ndarray,
@@ -195,7 +348,7 @@ def _score_candidate(
         upright = float(oracle_env.physics.torso_upright())
         rewards.append(float(ts.reward or 0.0))
         smooth_cost += float(np.mean((action - last_action) ** 2))
-        speed_tracking += float(np.exp(-((velocity - cfg.target_speed) ** 2) / 0.5))
+        speed_tracking += float(np.exp(-((velocity - TARGET_SPEED) ** 2) / 0.5))
         overspeed_cost += max(velocity - 1.8, 0.0) ** 2
         posture_cost += max(1.0 - height, 0.0) ** 2 + max(0.75 - upright, 0.0) ** 2
         last_action = action
@@ -205,21 +358,18 @@ def _score_candidate(
     final_x = float(oracle_env.physics.named.data.xpos["torso", "x"])
     progress = max(final_x - start_x, 0.0)
     n = max(len(rewards), 1)
-    reward_score = discounted_sum(rewards, cfg.reward_gamma)
-    energy_cost = float(np.mean(actions**2))
     return (
-        reward_score
-        + cfg.progress_bonus * progress
-        + cfg.speed_tracking_bonus * (speed_tracking / n)
-        - cfg.overspeed_penalty * (overspeed_cost / n)
-        - cfg.posture_penalty * (posture_cost / n)
-        - cfg.action_penalty * energy_cost
-        - cfg.action_smoothness_penalty * smooth_cost
+        discounted_sum(rewards, ORACLE_REWARD_GAMMA)
+        + PROGRESS_BONUS * progress
+        + SPEED_TRACKING_BONUS * (speed_tracking / n)
+        - OVERSPEED_PENALTY * (overspeed_cost / n)
+        - POSTURE_PENALTY * (posture_cost / n)
+        - ACTION_PENALTY * float(np.mean(actions**2))
+        - ACTION_SMOOTHNESS_PENALTY * smooth_cost
     )
 
 
-def _oracle_cem_plan(
-    cfg: Config,
+def oracle_cem_plan(
     oracle_env,
     state0: np.ndarray,
     low: np.ndarray,
@@ -227,33 +377,35 @@ def _oracle_cem_plan(
     init_mean: np.ndarray,
     previous_action: np.ndarray,
     rng: np.random.Generator,
-) -> Tuple[np.ndarray, float, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float]:
     action_dim = low.shape[0]
     mean = init_mean.astype(np.float32).copy()
-    std = np.full_like(mean, cfg.cem_init_std, dtype=np.float32)
-    topk = min(cfg.cem_topk, cfg.cem_samples)
+    std = np.full_like(mean, ORACLE_CEM_INIT_STD, dtype=np.float32)
+    topk = min(ORACLE_CEM_TOPK, ORACLE_CEM_SAMPLES)
 
     best_plan: np.ndarray | None = None
     best_score = -float("inf")
 
-    for _ in range(cfg.cem_iters):
+    for _ in range(ORACLE_CEM_ITERS):
         samples = rng.normal(
             loc=mean[None],
             scale=std[None],
-            size=(cfg.cem_samples, cfg.plan_horizon, action_dim),
+            size=(ORACLE_CEM_SAMPLES, ORACLE_PLAN_HORIZON, action_dim),
         ).astype(np.float32)
         samples[0] = mean
-        samples = np.clip(samples, low, high)
+        samples = np.clip(samples, low.reshape(1, 1, -1), high.reshape(1, 1, -1))
 
         scores = np.empty(samples.shape[0], dtype=np.float32)
         for i in range(samples.shape[0]):
-            scores[i] = _score_candidate(cfg, oracle_env, state0, samples[i], previous_action)
+            scores[i] = score_oracle_candidate(
+                oracle_env, state0, samples[i], previous_action
+            )
 
         elite_idx = np.argpartition(-scores, topk - 1)[:topk]
         elites = samples[elite_idx]
         elite_mean = elites.mean(axis=0).astype(np.float32)
-        elite_std = np.maximum(elites.std(axis=0), cfg.cem_min_std).astype(np.float32)
-        mean = (1.0 - cfg.cem_momentum) * elite_mean + cfg.cem_momentum * mean
+        elite_std = np.maximum(elites.std(axis=0), ORACLE_CEM_MIN_STD).astype(np.float32)
+        mean = (1.0 - ORACLE_CEM_MOMENTUM) * elite_mean + ORACLE_CEM_MOMENTUM * mean
         std = elite_std
 
         i_best = int(np.argmax(scores))
@@ -262,58 +414,79 @@ def _oracle_cem_plan(
             best_plan = samples[i_best].copy()
 
     assert best_plan is not None
-    return best_plan[0].astype(np.float32), best_score, mean.astype(np.float32)
+    return best_plan[0].astype(np.float32), mean.astype(np.float32), best_score
 
 
-# ---------------------------------------------------------------------------
-# Episode collection.
-# ---------------------------------------------------------------------------
-
-
-def render_frame(env, cfg: Config) -> np.ndarray:
-    """Render a frame at training image_size (square)."""
-    return env.physics.render(
-        height=cfg.image_size,
-        width=cfg.image_size,
-        camera_id=cfg.video_camera_id,
-    ).astype(np.uint8)
-
-
-def collect_oracle_episode(cfg: Config, episode_seed: int, desc: str = "oracle") -> dict:
-    """Run one Oracle-CEM episode and return pixels (uint8), actions (fp32), rewards."""
-    rng = np.random.default_rng(episode_seed)
-    main_env = make_env(episode_seed)
-    oracle_env = make_env(episode_seed + 10_000)
-
-    low, high = action_bounds(main_env)
+def collect_oracle_episode(
+    seed: int,
+    noisy: bool,
+    desc: str,
+    progress: bool = True,
+    progress_queue=None,
+    progress_id: int | None = None,
+) -> dict:
+    rng = np.random.default_rng(seed)
+    env = make_env(seed)
+    oracle_env = make_env(seed + 10_000)
+    low, high = action_bounds(env)
     action_dim = int(low.shape[0])
-    main_env.reset()
+    env.reset()
 
-    plan_mean = np.zeros((cfg.plan_horizon, action_dim), dtype=np.float32)
+    plan_mean = np.zeros((ORACLE_PLAN_HORIZON, action_dim), dtype=np.float32)
     previous_action = np.zeros(action_dim, dtype=np.float32)
+    eta = np.zeros(action_dim, dtype=np.float32)
+    ou_scale = float(np.sqrt(1.0 - OU_RHO * OU_RHO))
 
-    pixels: List[np.ndarray] = []
+    pixels: List[np.ndarray] = [render_dataset_frame(env)]
     actions: List[np.ndarray] = []
+    oracle_actions: List[np.ndarray] = []
     rewards: List[float] = []
-    diags: List[dict] = []
+    heights: List[float] = []
+    uprights: List[float] = []
+    velocities: List[float] = []
+    torso_x: List[float] = []
+    sigmas: List[float] = []
+    planner_scores: List[float] = []
 
-    bar = tqdm(range(cfg.episode_steps), desc=desc, dynamic_ncols=True, leave=False)
-    for _ in bar:
-        pixels.append(render_frame(main_env, cfg))
-        state0 = main_env.physics.get_state().copy()
-
-        action, _, plan_mean = _oracle_cem_plan(
-            cfg, oracle_env, state0, low, high, plan_mean, previous_action, rng
+    bar = tqdm(
+        range(DATASET_EPISODE_STEPS),
+        desc=desc,
+        dynamic_ncols=True,
+        leave=False,
+        disable=not progress,
+    )
+    for step in bar:
+        state0 = env.physics.get_state().copy()
+        oracle_action, plan_mean, score = oracle_cem_plan(
+            oracle_env, state0, low, high, plan_mean, previous_action, rng
         )
         plan_mean = np.concatenate(
-            [plan_mean[1:], np.zeros((1, action_dim), dtype=np.float32)], axis=0
+            [plan_mean[1:], np.zeros((1, action_dim), dtype=np.float32)],
+            axis=0,
         )
 
-        ts = main_env.step(action)
-        diag = diagnostics(main_env)
-        diags.append(diag)
+        sigma = perturb_sigma(step) if noisy else 0.0
+        if burst_starts(step):
+            eta[:] = 0.0
+        if sigma > 0.0:
+            eta = OU_RHO * eta + ou_scale * rng.standard_normal(action_dim).astype(np.float32)
+            action = np.clip(oracle_action + sigma * eta, low, high).astype(np.float32)
+        else:
+            eta[:] = 0.0
+            action = oracle_action
+
+        ts = env.step(action)
+        diag = diagnostics(env)
+        pixels.append(render_dataset_frame(env))
         actions.append(action.copy())
+        oracle_actions.append(oracle_action.copy())
         rewards.append(float(ts.reward or 0.0))
+        heights.append(diag["torso_height"])
+        uprights.append(diag["torso_upright"])
+        velocities.append(diag["horizontal_velocity"])
+        torso_x.append(diag["torso_x"])
+        sigmas.append(sigma)
+        planner_scores.append(float(score))
         previous_action = action
 
         bar.set_postfix(
@@ -321,232 +494,837 @@ def collect_oracle_episode(cfg: Config, episode_seed: int, desc: str = "oracle")
                 "ret": f"{sum(rewards):.1f}",
                 "v": f"{diag['horizontal_velocity']:.2f}",
                 "h": f"{diag['torso_height']:.2f}",
+                "up": f"{diag['torso_upright']:.2f}",
+                "sig": f"{sigma:.2f}",
             }
+        )
+        emit_progress(
+            progress_queue,
+            progress_id,
+            {
+                "ret": f"{sum(rewards):.1f}",
+                "v": f"{diag['horizontal_velocity']:.2f}",
+                "h": f"{diag['torso_height']:.2f}",
+                "up": f"{diag['torso_upright']:.2f}",
+                "sig": f"{sigma:.2f}",
+            },
         )
         if ts.last():
             break
-    bar.close()
 
-    main_env.close()
+    bar.close()
+    env.close()
     oracle_env.close()
 
+    metadata = {
+        "domain": DOMAIN,
+        "task": TASK,
+        "seed": seed,
+        "noisy": noisy,
+        "perturb_schedule": [
+            {"start": s, "length": length, "sigma": sigma}
+            for s, length, sigma in PERTURB_SCHEDULE
+        ],
+        "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
+    }
     return {
-        "pixels": np.stack(pixels, axis=0).astype(np.uint8),       # (T, H, W, 3)
-        "actions": np.stack(actions, axis=0).astype(np.float32),   # (T, action_dim)
+        "pixels": np.stack(pixels, axis=0).astype(np.uint8),
+        "actions": np.stack(actions, axis=0).astype(np.float32),
+        "oracle_actions": np.stack(oracle_actions, axis=0).astype(np.float32),
         "rewards": np.asarray(rewards, dtype=np.float32),
-        "diagnostics": diags,
+        "torso_height": np.asarray(heights, dtype=np.float32),
+        "torso_upright": np.asarray(uprights, dtype=np.float32),
+        "horizontal_velocity": np.asarray(velocities, dtype=np.float32),
+        "torso_x": np.asarray(torso_x, dtype=np.float32),
+        "sigmas": np.asarray(sigmas, dtype=np.float32),
+        "planner_scores": np.asarray(planner_scores, dtype=np.float32),
+        "metadata": json.dumps(metadata),
     }
 
 
-def generate_dataset(cfg: Config) -> Path:
-    """Generate `num_demo_episodes` episodes via Oracle CEM. Returns the
-    directory containing the per-episode npz files."""
-    data_dir = cfg.out_path() / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+def apply_recovery_pose(env, scenario: dict[str, float | str], rng: np.random.Generator) -> None:
+    """Place walker in a hard off-manifold pose before oracle recovery."""
+    env.physics.named.data.qpos["rootz"] = float(scenario["rootz"])
+    env.physics.named.data.qpos["rooty"] = float(scenario["rooty"])
+    env.physics.named.data.qvel["rootx"] = float(scenario["qvel_rootx"])
+    env.physics.named.data.qvel["rootz"] = float(scenario["qvel_rootz"])
+    env.physics.named.data.qvel["rooty"] = float(scenario["qvel_rooty"])
+    for name in [
+        "right_hip",
+        "right_knee",
+        "right_ankle",
+        "left_hip",
+        "left_knee",
+        "left_ankle",
+    ]:
+        env.physics.named.data.qpos[name] += float(rng.normal(0.0, 0.08))
+        env.physics.named.data.qvel[name] = float(rng.normal(0.0, 1.0))
+    env.physics.forward()
 
-    print(f"[data] Generating {cfg.num_demo_episodes} oracle episodes -> {data_dir}")
-    for i in range(cfg.num_demo_episodes):
-        ep_path = data_dir / f"episode_{i:03d}.npz"
-        if ep_path.exists():
-            print(f"  - {ep_path.name} already exists, skipping")
-            continue
-        ep = collect_oracle_episode(cfg, episode_seed=cfg.seed + i, desc=f"demo {i+1}/{cfg.num_demo_episodes}")
-        np.savez_compressed(
-            ep_path,
-            pixels=ep["pixels"],
-            actions=ep["actions"],
-            rewards=ep["rewards"],
+
+def collect_recovery_episode(
+    seed: int,
+    scenario: dict[str, float | str],
+    desc: str,
+    progress: bool = True,
+    progress_queue=None,
+    progress_id: int | None = None,
+) -> dict:
+    rng = np.random.default_rng(seed)
+    env = make_env(seed)
+    oracle_env = make_env(seed + 10_000)
+    low, high = action_bounds(env)
+    action_dim = int(low.shape[0])
+    env.reset()
+    apply_recovery_pose(env, scenario, rng)
+
+    plan_mean = np.zeros((ORACLE_PLAN_HORIZON, action_dim), dtype=np.float32)
+    previous_action = np.zeros(action_dim, dtype=np.float32)
+    pixels: List[np.ndarray] = [render_dataset_frame(env)]
+    actions: List[np.ndarray] = []
+    oracle_actions: List[np.ndarray] = []
+    rewards: List[float] = []
+    heights: List[float] = []
+    uprights: List[float] = []
+    velocities: List[float] = []
+    torso_x: List[float] = []
+    sigmas: List[float] = []
+    planner_scores: List[float] = []
+
+    bar = tqdm(
+        range(RECOVERY_STEPS),
+        desc=desc,
+        dynamic_ncols=True,
+        leave=False,
+        disable=not progress,
+    )
+    for _ in bar:
+        state0 = env.physics.get_state().copy()
+        oracle_action, plan_mean, score = oracle_cem_plan(
+            oracle_env, state0, low, high, plan_mean, previous_action, rng
         )
-        ep_return = float(ep["rewards"].sum())
-        print(f"  + {ep_path.name}  steps={len(ep['actions'])}  return={ep_return:.1f}")
-    # Also pick the best-return episode and save as goal trajectory.
-    best_path = pick_best_episode(data_dir)
-    goal_path = data_dir / "goal_trajectory.npz"
-    if not goal_path.exists():
-        ep = np.load(best_path)
-        np.savez_compressed(goal_path, pixels=ep["pixels"], actions=ep["actions"], rewards=ep["rewards"])
-        print(f"[data] Goal trajectory <- {best_path.name}")
-    return data_dir
+        plan_mean = np.concatenate(
+            [plan_mean[1:], np.zeros((1, action_dim), dtype=np.float32)],
+            axis=0,
+        )
+        ts = env.step(oracle_action)
+        diag = diagnostics(env)
+        pixels.append(render_dataset_frame(env))
+        actions.append(oracle_action.copy())
+        oracle_actions.append(oracle_action.copy())
+        rewards.append(float(ts.reward or 0.0))
+        heights.append(diag["torso_height"])
+        uprights.append(diag["torso_upright"])
+        velocities.append(diag["horizontal_velocity"])
+        torso_x.append(diag["torso_x"])
+        sigmas.append(0.0)
+        planner_scores.append(float(score))
+        previous_action = oracle_action
+        bar.set_postfix(
+            {
+                "ret": f"{sum(rewards):.1f}",
+                "v": f"{diag['horizontal_velocity']:.2f}",
+                "h": f"{diag['torso_height']:.2f}",
+                "up": f"{diag['torso_upright']:.2f}",
+            }
+        )
+        emit_progress(
+            progress_queue,
+            progress_id,
+            {
+                "ret": f"{sum(rewards):.1f}",
+                "v": f"{diag['horizontal_velocity']:.2f}",
+                "h": f"{diag['torso_height']:.2f}",
+                "up": f"{diag['torso_upright']:.2f}",
+            },
+        )
+        if ts.last():
+            break
+
+    bar.close()
+    env.close()
+    oracle_env.close()
+    metadata = {
+        "domain": DOMAIN,
+        "task": TASK,
+        "seed": seed,
+        "kind": "scripted_recovery",
+        "scenario": scenario,
+        "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
+    }
+    return {
+        "pixels": np.stack(pixels, axis=0).astype(np.uint8),
+        "actions": np.stack(actions, axis=0).astype(np.float32),
+        "oracle_actions": np.stack(oracle_actions, axis=0).astype(np.float32),
+        "rewards": np.asarray(rewards, dtype=np.float32),
+        "torso_height": np.asarray(heights, dtype=np.float32),
+        "torso_upright": np.asarray(uprights, dtype=np.float32),
+        "horizontal_velocity": np.asarray(velocities, dtype=np.float32),
+        "torso_x": np.asarray(torso_x, dtype=np.float32),
+        "sigmas": np.asarray(sigmas, dtype=np.float32),
+        "planner_scores": np.asarray(planner_scores, dtype=np.float32),
+        "metadata": json.dumps(metadata),
+    }
 
 
-def pick_best_episode(data_dir: Path) -> Path:
-    eps = sorted(data_dir.glob("episode_*.npz"))
-    best_path = eps[0]
+def dataset_ready() -> bool:
+    if not (
+        DATASET_DIR.exists()
+        and (DATASET_DIR / "goal_trajectory.npz").exists()
+        and bool(list(DATASET_DIR.glob("episode_*.npz")))
+    ):
+        return False
+    metadata_path = DATASET_DIR / "metadata.json"
+    if not metadata_path.exists():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except json.JSONDecodeError:
+        return False
+    return int(metadata.get("dataset_version", -1)) == DATASET_VERSION
+
+
+def save_episode(path: Path, episode: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **episode)
+
+
+def dataset_targets() -> dict[str, int]:
+    targets = {
+        "clean": CLEAN_DEMO_EPISODES,
+        "perturbed": PERTURBED_DEMO_EPISODES,
+    }
+    for scenario in RECOVERY_POSES:
+        targets[f"recovery/{scenario['name']}"] = RECOVERY_REPEATS
+    return targets
+
+
+def make_attempt_job(kind: str, attempt: int, idx: int, have: int, target: int) -> dict:
+    desc = f"try{idx:03d} {kind} {have + 1}/{target}"
+    job = {
+        "idx": idx,
+        "kind": kind,
+        "bar_desc": desc,
+        "desc": desc,
+    }
+    if kind == "clean":
+        job.update(
+            {
+                "collector": "oracle",
+                "seed": SEED + attempt,
+                "noisy": False,
+            }
+        )
+        return job
+    if kind == "perturbed":
+        job.update(
+            {
+                "collector": "oracle",
+                "seed": SEED + 1_000 + attempt,
+                "noisy": True,
+            }
+        )
+        return job
+
+    scenario_name = kind.split("/", 1)[1]
+    for scenario_idx, scenario in enumerate(RECOVERY_POSES):
+        if scenario["name"] == scenario_name:
+            job.update(
+                {
+                    "collector": "recovery",
+                    "seed": SEED + 2_000 + scenario_idx * 10_000 + attempt,
+                    "scenario": dict(scenario),
+                }
+            )
+            return job
+    raise ValueError(f"unknown dataset kind: {kind}")
+
+
+def collect_episode_job(job: dict) -> tuple[int, str, dict]:
+    progress = bool(job.get("progress", False))
+    progress_queue = job.get("progress_queue")
+    progress_id = int(job["idx"]) if progress_queue is not None else None
+    if job["collector"] == "oracle":
+        episode = collect_oracle_episode(
+            seed=int(job["seed"]),
+            noisy=bool(job["noisy"]),
+            desc=str(job["desc"]),
+            progress=progress,
+            progress_queue=progress_queue,
+            progress_id=progress_id,
+        )
+    elif job["collector"] == "recovery":
+        episode = collect_recovery_episode(
+            seed=int(job["seed"]),
+            scenario=job["scenario"],
+            desc=str(job["desc"]),
+            progress=progress,
+            progress_queue=progress_queue,
+            progress_id=progress_id,
+        )
+    else:
+        raise ValueError(f"unknown dataset collector: {job['collector']}")
+    return int(job["idx"]), str(job["kind"]), episode
+
+
+def collect_dataset_episodes_sequential(
+    jobs: list[dict],
+    save_dir: Path,
+) -> list[tuple[Path, str]]:
+    saved: list[tuple[Path, str]] = []
+    for job in jobs:
+        idx, kind, ep = collect_episode_job({**job, "progress": True})
+        path = save_dir / f"candidate_{idx:04d}.npz"
+        save_episode(path, ep)
+        saved.append((path, kind))
+    return saved
+
+
+def remove_partial_episodes(save_dir: Path) -> None:
+    for path in save_dir.glob("candidate_*.npz"):
+        path.unlink()
+
+
+def job_total(job: dict) -> int:
+    return RECOVERY_STEPS if job["collector"] == "recovery" else DATASET_EPISODE_STEPS
+
+
+def job_bar_desc(job: dict) -> str:
+    return str(job.get("bar_desc", f"try{int(job['idx']):03d} {job['kind']}"))
+
+
+def collect_dataset_episodes(
+    jobs: list[dict],
+    save_dir: Path,
+) -> list[tuple[Path, str]]:
+    workers = max(1, min(DATASET_WORKERS, len(jobs)))
+    save_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[data] collecting {len(jobs)} candidate episodes with workers={workers}")
+
+    if workers == 1:
+        return collect_dataset_episodes_sequential(jobs, save_dir)
+
+    try:
+        ctx = mp.get_context(DATASET_MP_START_METHOD)
+        saved: list[tuple[Path, str]] = []
+        futures = {}
+        with ctx.Manager() as manager:
+            progress_queue = manager.Queue()
+            bars = {
+                int(job["idx"]): tqdm(
+                    total=job_total(job),
+                    desc=job_bar_desc(job),
+                    position=pos,
+                    leave=True,
+                    dynamic_ncols=True,
+                )
+                for pos, job in enumerate(jobs)
+            }
+            try:
+                with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+                    for job in jobs:
+                        futures[
+                            pool.submit(
+                                collect_episode_job,
+                                {**job, "progress_queue": progress_queue},
+                            )
+                        ] = job
+                    pending = set(futures)
+                    while pending:
+                        while True:
+                            try:
+                                progress_id, n_steps, postfix = progress_queue.get_nowait()
+                            except Empty:
+                                break
+                            bar = bars.get(int(progress_id))
+                            if bar is not None:
+                                step_inc = min(
+                                    int(n_steps),
+                                    max(int(bar.total or 0) - int(bar.n), 0),
+                                )
+                                if step_inc > 0:
+                                    bar.update(step_inc)
+                                if postfix:
+                                    bar.set_postfix(postfix)
+
+                        done = [fut for fut in pending if fut.done()]
+                        if not done:
+                            time.sleep(0.05)
+                            continue
+                        for fut in done:
+                            pending.remove(fut)
+                            idx, kind, ep = fut.result()
+                            path = save_dir / f"candidate_{idx:04d}.npz"
+                            save_episode(path, ep)
+                            saved.append((path, kind))
+                            bar = bars.get(idx)
+                            if bar is not None and bar.n < bar.total:
+                                bar.update(bar.total - bar.n)
+                        for bar in bars.values():
+                            bar.refresh()
+
+                while True:
+                    try:
+                        progress_id, n_steps, postfix = progress_queue.get_nowait()
+                    except Empty:
+                        break
+                    bar = bars.get(int(progress_id))
+                    if bar is not None:
+                        step_inc = min(int(n_steps), max(int(bar.total or 0) - int(bar.n), 0))
+                        if step_inc > 0:
+                            bar.update(step_inc)
+                        if postfix:
+                            bar.set_postfix(postfix)
+            finally:
+                for bar in bars.values():
+                    bar.close()
+        return sorted(saved, key=lambda item: item[0].name)
+    except Exception as exc:
+        print(f"[data] parallel collection failed ({type(exc).__name__}: {exc})")
+        print("[data] retrying dataset collection sequentially")
+        remove_partial_episodes(save_dir)
+        return collect_dataset_episodes_sequential(jobs, save_dir)
+
+
+def build_static_dataset() -> None:
+    if dataset_ready():
+        print(f"[data] using existing dataset -> {DATASET_DIR}")
+        return
+
+    print(f"[data] creating static dataset -> {DATASET_DIR}")
+    if DATASET_DIR.exists():
+        shutil.rmtree(DATASET_DIR)
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
+    kept, summaries = collect_successful_dataset()
+
+    clean_paths = [path for path, kind in kept if kind == "clean"]
+    if not clean_paths:
+        raise RuntimeError("No successful clean walking demos were collected.")
+
+    goal_path = pick_best_clean_episode(clean_paths)
+    with np.load(goal_path) as goal:
+        np.savez_compressed(
+            DATASET_DIR / "goal_trajectory.npz",
+            pixels=goal["pixels"],
+            actions=goal["actions"],
+            rewards=goal["rewards"],
+            torso_height=goal["torso_height"],
+            torso_upright=goal["torso_upright"],
+            horizontal_velocity=goal["horizontal_velocity"],
+            metadata=json.dumps(
+                {
+                    "source_episode": goal_path.name,
+                    "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
+                }
+            ),
+        )
+
+    write_json(
+        DATASET_DIR / "metadata.json",
+        {
+            "dataset_version": DATASET_VERSION,
+            "config": hparams(),
+            "episodes": summaries,
+            "goal_episode": goal_path.name,
+        },
+    )
+    recovery_count = sum(kind.startswith("recovery/") for _, kind in kept)
+    skipped = sum(bool(summary.get("skipped", False)) for summary in summaries)
+    print(
+        f"[data] wrote {len(kept)} usable episodes "
+        f"({recovery_count} recovery, {skipped} skipped) and goal trajectory"
+    )
+
+
+def collect_successful_dataset() -> tuple[list[tuple[Path, str]], list[dict]]:
+    targets = dataset_targets()
+    successes = {kind: 0 for kind in targets}
+    attempts = {kind: 0 for kind in targets}
+    candidate_dir = DATASET_DIR / "candidates"
+    kept: list[tuple[Path, str]] = []
+    summaries: list[dict] = []
+    next_candidate_idx = 0
+    next_episode_idx = 0
+
+    while any(successes[kind] < target for kind, target in targets.items()):
+        jobs: list[dict] = []
+        for kind, target in targets.items():
+            missing = target - successes[kind]
+            if missing <= 0:
+                continue
+            max_attempts = target * MAX_ATTEMPTS_PER_SUCCESS
+            remaining_attempts = max_attempts - attempts[kind]
+            if remaining_attempts <= 0:
+                raise RuntimeError(
+                    f"Could not collect enough successful {kind} episodes: "
+                    f"{successes[kind]}/{target} succeeded after {attempts[kind]} attempts."
+                )
+            for _ in range(min(missing, remaining_attempts)):
+                jobs.append(
+                    make_attempt_job(
+                        kind=kind,
+                        attempt=attempts[kind],
+                        idx=next_candidate_idx,
+                        have=successes[kind],
+                        target=target,
+                    )
+                )
+                attempts[kind] += 1
+                next_candidate_idx += 1
+
+        for candidate_path, kind in collect_dataset_episodes(jobs, candidate_dir):
+            summary = summarize_episode(candidate_path, kind)
+            summary["attempt_file"] = candidate_path.name
+            skip_reason = episode_skip_reason(summary)
+            if skip_reason is not None:
+                summary["skipped"] = True
+                summary["skip_reason"] = skip_reason
+                candidate_path.unlink(missing_ok=True)
+                print(
+                    f"[data] skip {candidate_path.name} {kind}: {skip_reason} "
+                    f"(ret={summary['return']:.1f}, "
+                    f"tail_r={summary['tail_reward']:.2f}, "
+                    f"tail_h={summary['tail_height']:.2f}, "
+                    f"tail_up={summary['tail_upright']:.2f})"
+                )
+                summaries.append(summary)
+                continue
+
+            if successes[kind] >= targets[kind]:
+                candidate_path.unlink(missing_ok=True)
+                continue
+
+            final_path = DATASET_DIR / f"episode_{next_episode_idx:03d}.npz"
+            candidate_path.replace(final_path)
+            successes[kind] += 1
+            next_episode_idx += 1
+            summary["file"] = final_path.name
+            summary["skipped"] = False
+            summaries.append(summary)
+            kept.append((final_path, kind))
+            print(
+                f"[data] keep {final_path.name} {kind}: "
+                f"{successes[kind]}/{targets[kind]} "
+                f"(ret={summary['return']:.1f}, tail_r={summary['tail_reward']:.2f})"
+            )
+
+        progress = ", ".join(
+            f"{kind}={successes[kind]}/{target}" for kind, target in targets.items()
+        )
+        print(f"[data] success quotas: {progress}")
+
+    shutil.rmtree(candidate_dir, ignore_errors=True)
+    return kept, summaries
+
+
+def summarize_episode(path: Path, kind: str) -> dict:
+    with np.load(path) as ep:
+        rewards = ep["rewards"]
+        tail_steps = min(QUALITY_TAIL_STEPS, len(rewards))
+        tail = slice(-tail_steps, None) if tail_steps else slice(0, 0)
+        heights = ep["torso_height"]
+        uprights = ep["torso_upright"]
+        velocities = ep["horizontal_velocity"]
+        return {
+            "file": path.name,
+            "kind": kind,
+            "steps": int(len(rewards)),
+            "return": float(rewards.sum()) if len(rewards) else 0.0,
+            "mean_height": float(np.nanmean(heights)),
+            "mean_upright": float(np.nanmean(uprights)),
+            "mean_velocity": float(np.nanmean(velocities)),
+            "min_height": float(np.nanmin(heights)),
+            "min_upright": float(np.nanmin(uprights)),
+            "tail_reward": float(np.nanmean(rewards[tail])) if tail_steps else 0.0,
+            "tail_height": float(np.nanmean(heights[tail])) if tail_steps else 0.0,
+            "tail_upright": float(np.nanmean(uprights[tail])) if tail_steps else 0.0,
+            "tail_velocity": float(np.nanmean(velocities[tail])) if tail_steps else 0.0,
+            "max_sigma": float(np.max(ep["sigmas"])) if "sigmas" in ep.files else 0.0,
+        }
+
+
+def tail_recovered(summary: dict) -> bool:
+    return (
+        summary["tail_reward"] >= TAIL_MIN_REWARD
+        and summary["tail_height"] >= TAIL_MIN_HEIGHT
+        and summary["tail_upright"] >= TAIL_MIN_UPRIGHT
+        and summary["tail_velocity"] >= TAIL_MIN_VELOCITY
+    )
+
+
+def has_real_off_manifold_prefix(summary: dict) -> bool:
+    return (
+        summary["min_height"] <= RECOVERY_MAX_MIN_HEIGHT
+        or summary["min_upright"] <= RECOVERY_MAX_MIN_UPRIGHT
+    )
+
+
+def episode_skip_reason(summary: dict) -> str | None:
+    kind = str(summary["kind"])
+    if kind == "clean":
+        if (
+            summary["return"] < CLEAN_MIN_RETURN
+            or summary["mean_height"] < CLEAN_MIN_MEAN_HEIGHT
+            or not tail_recovered(summary)
+        ):
+            return "failed_clean_demo"
+        return None
+
+    if kind == "perturbed":
+        if not tail_recovered(summary):
+            return "failed_perturbed_recovery"
+        return None
+
+    if kind.startswith("recovery/"):
+        if not tail_recovered(summary):
+            return "failed_recovery_tail"
+        if not has_real_off_manifold_prefix(summary):
+            return "not_off_manifold_recovery"
+        return None
+
+    return None
+
+
+def pick_best_clean_episode(paths: list[Path]) -> Path:
+    best_path = paths[0]
     best_return = -float("inf")
-    for p in eps:
-        with np.load(p) as ep:
+    for path in paths:
+        with np.load(path) as ep:
             ret = float(ep["rewards"].sum())
         if ret > best_return:
             best_return = ret
-            best_path = p
+            best_path = path
     return best_path
 
 
 # ---------------------------------------------------------------------------
-# Dataset / training.
+# LeWM data and training.
 # ---------------------------------------------------------------------------
 
 
-_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
-_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
-
-
-def preprocess_pixels(pixels: torch.Tensor, image_size: int) -> torch.Tensor:
-    """uint8 (B, T, H, W, 3) -> float (B, T, 3, image_size, image_size), ImageNet-normalized."""
+def preprocess_pixels(pixels: torch.Tensor) -> torch.Tensor:
     pixels = pixels.float() / 255.0
     pixels = pixels.permute(0, 1, 4, 2, 3).contiguous()
-    if pixels.size(-1) != image_size or pixels.size(-2) != image_size:
+    if pixels.size(-1) != IMAGE_SIZE or pixels.size(-2) != IMAGE_SIZE:
         b, t = pixels.shape[:2]
         pixels = pixels.view(b * t, *pixels.shape[2:])
-        pixels = F.interpolate(pixels, size=(image_size, image_size), mode="bilinear", align_corners=False)
+        pixels = F.interpolate(
+            pixels,
+            size=(IMAGE_SIZE, IMAGE_SIZE),
+            mode="bilinear",
+            align_corners=False,
+        )
         pixels = pixels.view(b, t, *pixels.shape[1:])
-    mean = _IMAGENET_MEAN.to(pixels)
-    std = _IMAGENET_STD.to(pixels)
-    return (pixels - mean) / std
+    return (pixels - _IMAGENET_MEAN.to(pixels)) / _IMAGENET_STD.to(pixels)
 
 
 class WalkerWindowDataset(torch.utils.data.Dataset):
-    """Sliding-window dataset over collected oracle episodes.
+    """Contiguous windows where action[t] predicts pixels[t+1]."""
 
-    Each item is a contiguous window of `history_size + num_preds` frames and
-    actions from a single episode. Pixels are kept as uint8 to save memory;
-    preprocessing happens on the fly at GPU side.
-    """
+    def __init__(self, dataset_dir: Path):
+        self.window_pixels = HISTORY_SIZE + max(NUM_PREDS, TRAIN_ROLLOUT_STEPS)
+        self.window_actions = self.window_pixels - 1
+        self.episodes: list[dict[str, np.ndarray]] = []
+        for path in sorted(dataset_dir.glob("episode_*.npz")):
+            with np.load(path) as ep:
+                pixels = ep["pixels"]
+                actions = ep["actions"].astype(np.float32)
+            if len(pixels) >= self.window_pixels and len(actions) >= self.window_actions:
+                self.episodes.append({"pixels": pixels, "actions": actions})
 
-    def __init__(self, data_dir: Path, history_size: int, num_preds: int):
-        self.window = history_size + num_preds
-        self.episodes: list[dict] = []
-        for p in sorted(data_dir.glob("episode_*.npz")):
-            with np.load(p) as ep:
-                pix = ep["pixels"]
-                act = ep["actions"]
-            if len(pix) < self.window:
-                continue
-            self.episodes.append({"pixels": pix, "actions": act.astype(np.float32)})
-
-        self.index: list[Tuple[int, int]] = []
-        for ei, ep in enumerate(self.episodes):
-            n = len(ep["actions"]) - self.window + 1
-            for s in range(n):
-                self.index.append((ei, s))
+        self.index: list[tuple[int, int]] = []
+        for ep_idx, ep in enumerate(self.episodes):
+            max_start = min(
+                len(ep["pixels"]) - self.window_pixels,
+                len(ep["actions"]) - self.window_actions,
+            )
+            for start in range(max_start + 1):
+                self.index.append((ep_idx, start))
 
         if not self.index:
-            raise RuntimeError(f"No valid windows in {data_dir}")
+            raise RuntimeError(f"No valid training windows in {dataset_dir}")
 
     def __len__(self) -> int:
         return len(self.index)
 
     def __getitem__(self, idx: int):
-        ei, s = self.index[idx]
-        ep = self.episodes[ei]
-        pix = ep["pixels"][s : s + self.window]      # (T, H, W, 3) uint8
-        act = ep["actions"][s : s + self.window]     # (T, action_dim) fp32
-        return torch.from_numpy(pix), torch.from_numpy(act)
+        ep_idx, start = self.index[idx]
+        ep = self.episodes[ep_idx]
+        pixels = ep["pixels"][start : start + self.window_pixels]
+        actions = ep["actions"][start : start + self.window_actions]
+        return torch.from_numpy(pixels), torch.from_numpy(actions)
 
 
-def train_lewm(cfg: Config, data_dir: Path) -> Path:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[train] device={device}")
+def new_model(action_dim: int, device: torch.device):
+    return build_lewm(
+        action_dim=action_dim,
+        frameskip=FRAMESKIP,
+        history_size=HISTORY_SIZE,
+        embed_dim=EMBED_DIM,
+        encoder_scale=ENCODER_SCALE,
+        patch_size=PATCH_SIZE,
+        image_size=IMAGE_SIZE,
+        predictor_depth=PREDICTOR_DEPTH,
+        predictor_heads=PREDICTOR_HEADS,
+        predictor_dim_head=PREDICTOR_DIM_HEAD,
+        predictor_mlp_dim=PREDICTOR_MLP_DIM,
+        predictor_dropout=PREDICTOR_DROPOUT,
+    ).to(device)
 
-    dataset = WalkerWindowDataset(data_dir, cfg.history_size, cfg.num_preds)
-    print(f"[train] windows={len(dataset)}  episodes={len(dataset.episodes)}")
 
-    sample_actions = dataset.episodes[0]["actions"]
-    action_dim = int(sample_actions.shape[1])
+def train_autocast(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
+
+def lewm_one_step_loss(
+    model,
+    sigreg: SIGReg,
+    pixels: torch.Tensor,
+    actions: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    actions = torch.nan_to_num(actions, 0.0)
+    info = model.encode({"pixels": pixels, "action": actions[:, :HISTORY_SIZE]})
+    emb = info["emb"]
+    act_emb = info["act_emb"]
+
+    ctx_emb = emb[:, :HISTORY_SIZE]
+    target_emb = emb[:, 1 : HISTORY_SIZE + 1]
+    pred_emb = model.predict(ctx_emb, act_emb[:, :HISTORY_SIZE])
+    pred_loss = (pred_emb - target_emb).pow(2).mean()
+
+    rollout_steps = min(TRAIN_ROLLOUT_STEPS, pixels.size(1) - HISTORY_SIZE)
+    hist_actions = torch.zeros_like(actions[:, :HISTORY_SIZE])
+    if HISTORY_SIZE > 1:
+        hist_actions[:, 1:] = actions[:, : HISTORY_SIZE - 1]
+    future_actions = actions[:, HISTORY_SIZE - 1 : HISTORY_SIZE - 1 + rollout_steps]
+    rollout_pred = aligned_rollout_latents(
+        model,
+        pixels[:, :HISTORY_SIZE],
+        hist_actions,
+        future_actions.unsqueeze(1),
+    ).squeeze(1)
+    rollout_target = emb[:, HISTORY_SIZE : HISTORY_SIZE + rollout_steps]
+    rollout_loss = (rollout_pred - rollout_target).pow(2).mean()
+
+    sigreg_loss = sigreg(emb.transpose(0, 1))
+    loss = pred_loss + ROLLOUT_LOSS_WEIGHT * rollout_loss + SIGREG_WEIGHT * sigreg_loss
+    return {
+        "loss": loss,
+        "pred_loss": pred_loss.detach(),
+        "rollout_loss": rollout_loss.detach(),
+        "sigreg_loss": sigreg_loss.detach(),
+    }
+
+
+def train_lewm() -> tuple[Path, int]:
+    dataset = WalkerWindowDataset(DATASET_DIR)
+    action_dim = int(dataset.episodes[0]["actions"].shape[1])
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=cfg.train_batch_size,
+        batch_size=TRAIN_BATCH_SIZE,
         shuffle=True,
         drop_last=True,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
+        num_workers=TRAIN_NUM_WORKERS,
+        persistent_workers=TRAIN_NUM_WORKERS > 0,
+        pin_memory=torch.cuda.is_available(),
     )
 
-    model = build_lewm(
-        action_dim=action_dim,
-        frameskip=cfg.frameskip,
-        history_size=cfg.history_size,
-        embed_dim=cfg.embed_dim,
-        encoder_scale=cfg.encoder_scale,
-        patch_size=cfg.patch_size,
-        image_size=cfg.image_size,
-        predictor_depth=cfg.predictor_depth,
-        predictor_heads=cfg.predictor_heads,
-        predictor_dim_head=cfg.predictor_dim_head,
-        predictor_mlp_dim=cfg.predictor_mlp_dim,
-        predictor_dropout=cfg.predictor_dropout,
-    ).to(device)
-    sigreg = SIGReg(knots=cfg.sigreg_knots, num_proj=cfg.sigreg_num_proj).to(device)
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    model = new_model(action_dim, device)
+    sigreg = SIGReg(knots=SIGREG_KNOTS, num_proj=SIGREG_NUM_PROJ).to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[train] LeWM params: {n_params/1e6:.2f}M")
-
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    print(
+        f"[train] device={device} params={n_params / 1e6:.2f}M "
+        f"windows={len(dataset)} episodes={len(dataset.episodes)}"
+    )
+    if TRAIN_LOG_PATH.exists():
+        TRAIN_LOG_PATH.unlink()
+    append_jsonl(
+        TRAIN_LOG_PATH,
+        {
+            "event": "start",
+            "device": str(device),
+            "params": n_params,
+            "windows": len(dataset),
+            "episodes": len(dataset.episodes),
+            "config": hparams(),
+        },
+    )
 
     model.train()
     step = 0
-    pbar = tqdm(total=cfg.train_steps, desc="train", dynamic_ncols=True)
-    while step < cfg.train_steps:
+    last_log: dict[str, float] = {}
+    pbar = tqdm(total=TRAIN_STEPS, desc="train LeWM", dynamic_ncols=True)
+    while step < TRAIN_STEPS:
         for pixels_u8, actions in loader:
-            if step >= cfg.train_steps:
+            if step >= TRAIN_STEPS:
                 break
             pixels_u8 = pixels_u8.to(device, non_blocking=True)
             actions = actions.to(device, non_blocking=True)
-            pixels = preprocess_pixels(pixels_u8, cfg.image_size)
+            pixels = preprocess_pixels(pixels_u8)
 
-            losses = lewm_loss(
-                model, sigreg, pixels, actions,
-                history_size=cfg.history_size,
-                num_preds=cfg.num_preds,
-                sigreg_weight=cfg.sigreg_weight,
-            )
+            with train_autocast(device):
+                losses = lewm_one_step_loss(model, sigreg, pixels, actions)
+
             optim.zero_grad(set_to_none=True)
             losses["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optim.step()
 
             step += 1
             pbar.update(1)
-            if step % cfg.log_every == 0 or step == 1:
-                pbar.set_postfix({
-                    "loss": f"{float(losses['loss']):.4f}",
-                    "pred": f"{float(losses['pred_loss']):.4f}",
-                    "sig":  f"{float(losses['sigreg_loss']):.4f}",
-                })
+            if step % LOG_EVERY == 0 or step == 1:
+                last_log = {
+                    "event": "step",
+                    "step": step,
+                    "loss": float(losses["loss"].detach()),
+                    "pred_loss": float(losses["pred_loss"]),
+                    "rollout_loss": float(losses["rollout_loss"]),
+                    "sigreg_loss": float(losses["sigreg_loss"]),
+                    "lr": float(optim.param_groups[0]["lr"]),
+                }
+                append_jsonl(TRAIN_LOG_PATH, last_log)
+                pbar.set_postfix(
+                    {
+                        "loss": f"{float(losses['loss'].detach()):.4f}",
+                        "pred": f"{float(losses['pred_loss']):.4f}",
+                        "roll": f"{float(losses['rollout_loss']):.4f}",
+                        "sig": f"{float(losses['sigreg_loss']):.4f}",
+                    }
+                )
     pbar.close()
 
-    ckpt_dir = cfg.out_path() / "ckpt"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / "lewm.pt"
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    ckpt_path = CKPT_DIR / "lewm.pt"
     torch.save(
         {
             "state_dict": model.state_dict(),
-            "config": asdict(cfg),
             "action_dim": action_dim,
+            "config": hparams(),
         },
         ckpt_path,
     )
     print(f"[train] saved -> {ckpt_path}")
-    return ckpt_path
+    append_jsonl(
+        TRAIN_LOG_PATH,
+        {
+            "event": "done",
+            "step": step,
+            "checkpoint": str(ckpt_path),
+            "last_log": last_log,
+        },
+    )
+    return ckpt_path, action_dim
 
 
-def load_lewm(cfg: Config, ckpt_path: Path, action_dim: int):
+def load_lewm(ckpt_path: Path, action_dim: int):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_lewm(
-        action_dim=action_dim,
-        frameskip=cfg.frameskip,
-        history_size=cfg.history_size,
-        embed_dim=cfg.embed_dim,
-        encoder_scale=cfg.encoder_scale,
-        patch_size=cfg.patch_size,
-        image_size=cfg.image_size,
-        predictor_depth=cfg.predictor_depth,
-        predictor_heads=cfg.predictor_heads,
-        predictor_dim_head=cfg.predictor_dim_head,
-        predictor_mlp_dim=cfg.predictor_mlp_dim,
-        predictor_dropout=cfg.predictor_dropout,
-    ).to(device)
+    model = new_model(action_dim, device)
     sd = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(sd["state_dict"], strict=True)
     model.eval()
@@ -555,281 +1333,535 @@ def load_lewm(cfg: Config, ckpt_path: Path, action_dim: int):
 
 
 # ---------------------------------------------------------------------------
-# LeWM-CEM evaluation: track the latent trajectory of an oracle demo.
+# Goal encoding and aligned LeWM rollout.
 # ---------------------------------------------------------------------------
 
 
-def encode_goal_trajectory(model, cfg: Config, goal_pixels: np.ndarray, device) -> torch.Tensor:
-    """Encode the full (T, H, W, 3) uint8 goal trajectory into latents (T, D)."""
-    g = torch.from_numpy(goal_pixels).unsqueeze(0).to(device)  # (1, T, H, W, 3)
-    g = preprocess_pixels(g, cfg.image_size)
-    out = model.encode({"pixels": g})
-    return out["emb"].squeeze(0)  # (T, D)
+@torch.no_grad()
+def encode_frames(model, pixels: np.ndarray, device: torch.device, chunk: int = 128) -> torch.Tensor:
+    chunks: list[torch.Tensor] = []
+    for start in range(0, len(pixels), chunk):
+        batch = torch.from_numpy(pixels[start : start + chunk]).unsqueeze(0).to(device)
+        emb = model.encode({"pixels": preprocess_pixels(batch)})["emb"].squeeze(0)
+        chunks.append(emb)
+    return torch.cat(chunks, dim=0)
 
 
+def frame_index(phase: int, goal_len: int) -> int:
+    if phase < goal_len:
+        return phase
+    start = min(GOAL_ORBIT_START, goal_len - 1)
+    orbit_len = max(goal_len - start, 1)
+    return start + ((phase - start) % orbit_len)
+
+
+def action_index(phase: int, num_actions: int) -> int:
+    if phase < num_actions:
+        return phase
+    start = min(GOAL_ORBIT_START, num_actions - 1)
+    orbit_len = max(num_actions - start, 1)
+    return start + ((phase - start) % orbit_len)
+
+
+@torch.no_grad()
+def phase_match(
+    current_latent: torch.Tensor,
+    goal_latents: torch.Tensor,
+    prev_phase: int,
+    first_step: bool,
+) -> int:
+    min_step = 0 if first_step else PHASE_MIN_STEP
+    lower = prev_phase + min_step
+    upper = prev_phase + PHASE_SEARCH_WINDOW
+    phases = list(range(lower, upper + 1))
+    indices = torch.tensor(
+        [frame_index(p, goal_latents.size(0)) for p in phases],
+        device=goal_latents.device,
+        dtype=torch.long,
+    )
+    candidates = goal_latents.index_select(0, indices)
+    dist = (candidates.float() - current_latent.view(1, -1).float()).pow(2).mean(dim=-1)
+    raw_phase = phases[int(torch.argmin(dist).item())]
+    if first_step:
+        return raw_phase
+    return max(prev_phase + PHASE_MIN_STEP, min(raw_phase, prev_phase + PHASE_MAX_STEP))
+
+
+def goal_window(
+    goal_latents: torch.Tensor,
+    goal_actions: torch.Tensor,
+    phase: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    frame_ids = [frame_index(phase + i + 1, goal_latents.size(0)) for i in range(PLAN_HORIZON)]
+    action_ids = [action_index(phase + i, goal_actions.size(0)) for i in range(PLAN_HORIZON)]
+    frame_idx = torch.tensor(frame_ids, device=goal_latents.device, dtype=torch.long)
+    action_idx = torch.tensor(action_ids, device=goal_actions.device, dtype=torch.long)
+    return goal_latents.index_select(0, frame_idx), goal_actions.index_select(0, action_idx)
+
+
+@torch.no_grad()
+def estimate_orbit_sigma(goal_latents: torch.Tensor) -> float:
+    start = min(GOAL_ORBIT_START, goal_latents.size(0) - 2)
+    orbit = goal_latents[start:].float()
+    if orbit.size(0) < 2:
+        return ORBIT_BLEND_SIGMA_MIN
+    step_dist = (orbit[1:] - orbit[:-1]).pow(2).mean(dim=-1)
+    sigma = ORBIT_BLEND_SIGMA_MULT * float(step_dist.median().item())
+    return float(np.clip(sigma, ORBIT_BLEND_SIGMA_MIN, ORBIT_BLEND_SIGMA_MAX))
+
+
+@torch.no_grad()
+def nearest_goal_phase(current_latent: torch.Tensor, goal_latents: torch.Tensor) -> tuple[int, float]:
+    dist = (goal_latents.float() - current_latent.view(1, -1).float()).pow(2).mean(dim=-1)
+    idx = int(torch.argmin(dist).item())
+    return idx, float(dist[idx].item())
+
+
+def orbit_rho(distance: float, sigma: float) -> float:
+    return float(np.exp(-distance / max(sigma, 1e-6)))
+
+
+@torch.no_grad()
+def rollout_prediction_diagnostics(
+    model,
+    goal_pixels: np.ndarray,
+    goal_actions_np: np.ndarray,
+    goal_latents: torch.Tensor,
+    device: torch.device,
+) -> dict:
+    action_dim = int(goal_actions_np.shape[1])
+    starts = [0, 1, 5, 20, 40]
+    out: dict[str, dict] = {}
+    max_horizon = min(PLAN_HORIZON, len(goal_actions_np) - HISTORY_SIZE)
+    for start in starts:
+        if start + HISTORY_SIZE + max_horizon >= len(goal_pixels):
+            continue
+        hist_pix = torch.from_numpy(goal_pixels[start : start + HISTORY_SIZE]).unsqueeze(0).to(device)
+        hist_actions = torch.zeros(1, HISTORY_SIZE, action_dim, device=device)
+        if HISTORY_SIZE > 1:
+            hist_actions[:, 1:] = torch.from_numpy(
+                goal_actions_np[start : start + HISTORY_SIZE - 1]
+            ).to(device)
+        future = torch.from_numpy(
+            goal_actions_np[
+                start + HISTORY_SIZE - 1 : start + HISTORY_SIZE - 1 + max_horizon
+            ]
+        ).view(1, 1, max_horizon, action_dim).to(device)
+        pred = aligned_rollout_latents(
+            model,
+            preprocess_pixels(hist_pix),
+            hist_actions,
+            future,
+        ).squeeze(0).squeeze(0)
+        target = goal_latents[start + HISTORY_SIZE : start + HISTORY_SIZE + max_horizon]
+        mse = (pred.float() - target.float()).pow(2).mean(dim=-1).detach().cpu().numpy()
+        out[f"true_history_{start}"] = {
+            "first": float(mse[0]),
+            "terminal": float(mse[-1]),
+            "mean": float(mse.mean()),
+        }
+
+    repeated = torch.from_numpy(
+        np.stack([goal_pixels[0].copy() for _ in range(HISTORY_SIZE)], axis=0)
+    ).unsqueeze(0).to(device)
+    repeated_actions = torch.zeros(1, HISTORY_SIZE, action_dim, device=device)
+    future = torch.from_numpy(goal_actions_np[:max_horizon]).view(
+        1, 1, max_horizon, action_dim
+    ).to(device)
+    pred = aligned_rollout_latents(
+        model,
+        preprocess_pixels(repeated),
+        repeated_actions,
+        future,
+    ).squeeze(0).squeeze(0)
+    target = goal_latents[1 : 1 + max_horizon]
+    mse = (pred.float() - target.float()).pow(2).mean(dim=-1).detach().cpu().numpy()
+    out["repeated_reset_history"] = {
+        "first": float(mse[0]),
+        "terminal": float(mse[-1]),
+        "mean": float(mse.mean()),
+    }
+    return out
+
+
+def block_actions_from_step_actions(actions: torch.Tensor) -> torch.Tensor:
+    blocks = actions[: PLAN_HORIZON].reshape(PLAN_BLOCKS, ACTION_BLOCK, -1)
+    return blocks.mean(dim=1)
+
+
+def step_actions_from_blocks(blocks: torch.Tensor) -> torch.Tensor:
+    if ACTION_BLOCK == 1:
+        return blocks
+    return blocks.repeat_interleave(ACTION_BLOCK, dim=0)
+
+
+def aligned_rollout_latents(
+    model,
+    history_pixels: torch.Tensor,
+    history_actions: torch.Tensor,
+    future_actions: torch.Tensor,
+) -> torch.Tensor:
+    """Roll out one-step LeWM dynamics with correct action alignment.
+
+    history_actions is shifted so action_buf[:, -H+1:] are the known actions
+    between context frames. The current-frame action is the candidate
+    future_actions[:, :, 0], so it affects the first prediction.
+    """
+    b, h = history_pixels.shape[:2]
+    samples, horizon = future_actions.shape[1:3]
+    hist = model.encode({"pixels": history_pixels})
+    emb = hist["emb"].unsqueeze(1).expand(b, samples, h, -1).reshape(b * samples, h, -1)
+    action_buf = (
+        history_actions.unsqueeze(1)
+        .expand(b, samples, h, -1)
+        .reshape(b * samples, h, -1)
+        .float()
+    )
+    future = future_actions.reshape(b * samples, horizon, -1).float()
+
+    preds = []
+    for t in range(horizon):
+        emb_in = emb[:, -HISTORY_SIZE:]
+        next_action = future[:, t : t + 1]
+        if HISTORY_SIZE == 1:
+            raw_actions = next_action
+        else:
+            raw_actions = torch.cat([action_buf[:, -HISTORY_SIZE + 1 :], next_action], dim=1)
+        act_emb = model.action_encoder(raw_actions)
+        pred = model.predict(emb_in, act_emb)[:, -1:]
+        preds.append(pred)
+        emb = torch.cat([emb, pred], dim=1)
+        action_buf = torch.cat([action_buf, next_action], dim=1)
+
+    pred = torch.cat(preds, dim=1)
+    return pred.reshape(b, samples, horizon, -1)
+
+
+# ---------------------------------------------------------------------------
+# Pure LeWM-CEM evaluation.
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
 def lewm_cem_plan(
     model,
-    cfg: Config,
-    history_pixels_u8: torch.Tensor,    # (1, H, H_img, W_img, 3) uint8
-    history_actions: torch.Tensor,      # (1, H, action_dim)
-    goal_latents_window: torch.Tensor,  # (1, T_plan, D)
-    init_mean: torch.Tensor,            # (T_plan, action_dim)
+    history_pixels_u8: torch.Tensor,
+    history_actions: torch.Tensor,
+    target_latents: torch.Tensor,
+    return_latents: torch.Tensor,
+    prior_actions: torch.Tensor,
+    rho: float,
+    previous_action: torch.Tensor,
     low: torch.Tensor,
     high: torch.Tensor,
     weights: torch.Tensor,
     rng: torch.Generator,
-    device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    action_dim = init_mean.size(-1)
-    mean = init_mean.clone()
-    std = torch.full_like(mean, cfg.eval_cem_init_std)
+    device: torch.device,
+) -> torch.Tensor:
+    action_dim = low.numel()
+    prior_blocks = block_actions_from_step_actions(prior_actions).to(device)
+    rho_t = torch.tensor(float(rho), device=device, dtype=torch.float32).clamp(0.0, 1.0)
+    mean = torch.clamp(prior_blocks, low, high)
+    std_scale = EVAL_CEM_INIT_STD + (1.0 - float(rho_t)) * FAR_CEM_EXTRA_STD
+    std = torch.full_like(mean, std_scale)
 
-    history_pixels = preprocess_pixels(history_pixels_u8.to(device), cfg.image_size)
+    history_pixels = preprocess_pixels(history_pixels_u8.to(device))
+    history_actions = history_actions.to(device)
+    target_latents = target_latents.to(device)
+    return_latents = return_latents.to(device).float()
 
     best_plan: torch.Tensor | None = None
     best_cost = float("inf")
+    for _ in range(EVAL_CEM_ITERS):
+        eps = torch.randn((EVAL_CEM_SAMPLES, PLAN_BLOCKS, action_dim), generator=rng, device=device)
+        block_samples = torch.clamp(mean.unsqueeze(0) + std.unsqueeze(0) * eps, low, high)
+        block_samples[0] = prior_blocks
+        block_samples[1] = mean
+        step_samples = block_samples.repeat_interleave(ACTION_BLOCK, dim=1)
 
-    for _ in range(cfg.eval_cem_iters):
-        eps = torch.randn(
-            (cfg.eval_cem_samples, cfg.eval_plan_horizon, action_dim),
-            generator=rng,
-            device=device,
+        pred = aligned_rollout_latents(
+            model,
+            history_pixels,
+            history_actions,
+            step_samples.unsqueeze(0),
+        ).squeeze(0)
+
+        goal = target_latents.unsqueeze(0).expand_as(pred)
+        diff = (pred.float() - goal.float()).pow(2).mean(dim=-1)
+        phase_cost = (diff * weights).mean(dim=1)
+        if LATENT_VELOCITY_WEIGHT > 0 and PLAN_HORIZON > 1:
+            pred_vel = pred[:, 1:] - pred[:, :-1]
+            goal_vel = goal[:, 1:] - goal[:, :-1]
+            vel_diff = (pred_vel.float() - goal_vel.float()).pow(2).mean(dim=-1)
+            phase_cost = phase_cost + LATENT_VELOCITY_WEIGHT * (vel_diff * weights[1:]).mean(dim=1)
+
+        samples, horizon, dim = pred.shape
+        return_dist = torch.cdist(
+            pred.reshape(samples * horizon, dim).float(),
+            return_latents,
+        ).pow(2).min(dim=1).values.div(dim).reshape(samples, horizon)
+        return_cost = (return_dist * weights).mean(dim=1)
+        return_cost = return_cost + RETURN_TERMINAL_WEIGHT * return_dist[:, -1]
+        cost = rho_t * phase_cost + (1.0 - rho_t) * return_cost
+
+        prior_cost = (block_samples - prior_blocks.unsqueeze(0)).pow(2).mean(dim=(1, 2))
+        prev = torch.cat(
+            [previous_action.view(1, 1, -1).expand(EVAL_CEM_SAMPLES, 1, -1), block_samples[:, :-1]],
+            dim=1,
         )
-        samples = mean.unsqueeze(0) + std.unsqueeze(0) * eps
-        samples[0] = mean  # keep current mean as one candidate
-        samples = torch.clamp(samples, low, high)
+        smooth_cost = (block_samples - prev).pow(2).mean(dim=(1, 2))
+        energy_cost = block_samples.pow(2).mean(dim=(1, 2))
+        cost = (
+            cost
+            + (rho_t * ACTION_PRIOR_WEIGHT) * prior_cost
+            + ACTION_SMOOTHNESS_WEIGHT * smooth_cost
+            + ACTION_ENERGY_WEIGHT * energy_cost
+        )
 
-        future_actions = samples.unsqueeze(0)  # (1, S, T_plan, action_dim)
-
-        cost = model.cem_rollout_cost(
-            history_pixels=history_pixels,
-            history_actions=history_actions.to(device),
-            future_actions=future_actions,
-            goal_latents=goal_latents_window,
-            weights=weights,
-        )  # (1, S)
-        cost = cost.squeeze(0)
-
-        topk = min(cfg.eval_cem_topk, cfg.eval_cem_samples)
+        topk = min(EVAL_CEM_TOPK, EVAL_CEM_SAMPLES)
         elite_idx = torch.topk(cost, topk, largest=False).indices
-        elites = samples[elite_idx]
+        elites = block_samples[elite_idx]
         elite_mean = elites.mean(dim=0)
-        elite_std = elites.std(dim=0).clamp_min(cfg.eval_cem_min_std)
-        mean = (1.0 - cfg.eval_cem_momentum) * elite_mean + cfg.eval_cem_momentum * mean
+        elite_std = elites.std(dim=0, unbiased=False).clamp_min(EVAL_CEM_MIN_STD)
+        mean = (1.0 - EVAL_CEM_MOMENTUM) * elite_mean + EVAL_CEM_MOMENTUM * mean
         std = elite_std
 
         i_best = int(torch.argmin(cost).item())
         if float(cost[i_best]) < best_cost:
             best_cost = float(cost[i_best])
-            best_plan = samples[i_best].clone()
+            best_plan = block_samples[i_best].clone()
 
     assert best_plan is not None
-    return best_plan, mean
+    return best_plan
 
 
-def evaluate_lewm_cem(cfg: Config, ckpt_path: Path, data_dir: Path) -> dict:
-    goal_path = data_dir / "goal_trajectory.npz"
-    if not goal_path.exists():
-        raise FileNotFoundError(f"missing goal trajectory: {goal_path}")
-    with np.load(goal_path) as g:
-        goal_pixels = g["pixels"]      # (T_goal, H, W, 3) uint8
-        goal_actions = g["actions"]    # (T_goal, action_dim)
+@torch.no_grad()
+def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
+    model, device = load_lewm(ckpt_path, action_dim)
+    with np.load(DATASET_DIR / "goal_trajectory.npz") as goal:
+        goal_pixels = goal["pixels"]
+        goal_actions_np = goal["actions"].astype(np.float32)
 
-    action_dim = int(goal_actions.shape[1])
-    model, device = load_lewm(cfg, ckpt_path, action_dim)
-    print(f"[eval] device={device}  goal_T={len(goal_pixels)}")
+    goal_latents = encode_frames(model, goal_pixels, device)
+    goal_actions = torch.from_numpy(goal_actions_np).to(device)
+    return_start = min(GOAL_ORBIT_START, goal_latents.size(0) - 1)
+    return_latents = goal_latents[return_start:]
+    orbit_sigma = estimate_orbit_sigma(goal_latents)
+    imageio.mimsave(OUT_DIR / "goal_trajectory.mp4", list(goal_pixels), fps=VIDEO_FPS)
+    diagnostics_payload = {
+        "rollout_prediction": rollout_prediction_diagnostics(
+            model, goal_pixels, goal_actions_np, goal_latents, device
+        ),
+        "orbit_sigma": float(orbit_sigma),
+    }
+    write_json(DIAGNOSTICS_PATH, diagnostics_payload)
 
-    # encode goal once
-    goal_latents = encode_goal_trajectory(model, cfg, goal_pixels, device)  # (T_goal, D)
-    T_goal = goal_latents.size(0)
+    if EVAL_TRACE_PATH.exists():
+        EVAL_TRACE_PATH.unlink()
 
-    # weights[t] = gamma**t
-    weights = torch.tensor(
-        [cfg.eval_traj_weight_gamma ** i for i in range(cfg.eval_plan_horizon)],
-        device=device, dtype=torch.float32,
-    )
-
-    main_env = make_env(cfg.seed + 9999)
-    main_env.reset()
-    low_np, high_np = action_bounds(main_env)
+    env = make_env(EVAL_SEED)
+    env.reset()
+    low_np, high_np = action_bounds(env)
     low = torch.tensor(low_np, device=device)
     high = torch.tensor(high_np, device=device)
+    zero = np.zeros(action_dim, dtype=np.float32)
 
-    # warm up history with `history_size` zero-action steps
-    history_frames: List[np.ndarray] = []
-    history_actions_list: List[np.ndarray] = []
-    for _ in range(cfg.history_size):
-        history_frames.append(render_frame(main_env, cfg))
-        zero_act = np.zeros(action_dim, dtype=np.float32)
-        ts = main_env.step(zero_act)
-        history_actions_list.append(zero_act.copy())
-        if ts.last():
-            break
+    initial_frame = render_dataset_frame(env)
+    history_frames: list[np.ndarray] = [initial_frame.copy()]
+    history_actions: list[np.ndarray] = [zero.copy()]
+    previous_action = torch.zeros(action_dim, device=device)
+    weights = torch.tensor(
+        [TRAJ_DISCOUNT**i for i in range(PLAN_HORIZON)],
+        device=device,
+        dtype=torch.float32,
+    )
+    gen_device = "cuda" if device.type == "cuda" else "cpu"
+    rng = torch.Generator(device=gen_device).manual_seed(SEED + 30_000)
 
-    plan_mean = torch.zeros((cfg.eval_plan_horizon, action_dim), device=device)
-    rng_th = torch.Generator(device=device).manual_seed(cfg.seed + 7777)
+    video_frames: list[np.ndarray] = []
+    rewards: list[float] = []
+    velocities: list[float] = []
+    heights: list[float] = []
+    uprights: list[float] = []
+    actions_out: list[np.ndarray] = []
+    phases: list[int] = []
+    rhos: list[float] = []
+    orbit_distances: list[float] = []
 
-    frames: List[np.ndarray] = []
-    rewards: List[float] = []
-    velocities: List[float] = []
-    heights: List[float] = []
-    uprights: List[float] = []
-
-    # Goal pointer: which frame in the goal trajectory we currently align to.
-    goal_ptr = 0
-
-    bar = tqdm(range(cfg.eval_steps), desc="lewm-cem eval", dynamic_ncols=True)
-    for t in bar:
-        # Render full-size frame for the video; convert to current history.
-        big_frame = main_env.physics.render(
-            height=cfg.video_height,
-            width=cfg.video_width,
-            camera_id=cfg.video_camera_id,
-        ).astype(np.uint8)
-        frames.append(big_frame)
-
-        # Build CEM history tensors.
-        hist_pix = np.stack(history_frames[-cfg.history_size:], axis=0)  # (H, H_img, W_img, 3)
-        hist_act = np.stack(history_actions_list[-cfg.history_size:], axis=0)
-        history_pixels_u8 = torch.from_numpy(hist_pix).unsqueeze(0)
-        history_actions = torch.from_numpy(hist_act).unsqueeze(0)
-
-        # Slice the goal trajectory for the next plan-horizon steps.
-        g_start = min(goal_ptr + 1, T_goal - 1)
-        g_end = min(g_start + cfg.eval_plan_horizon, T_goal)
-        if g_end - g_start < cfg.eval_plan_horizon:
-            # Pad the tail with the final goal latent.
-            tail = goal_latents[-1:].expand(cfg.eval_plan_horizon - (g_end - g_start), -1)
-            goal_window = torch.cat([goal_latents[g_start:g_end], tail], dim=0)
-        else:
-            goal_window = goal_latents[g_start:g_end]
-        goal_window = goal_window.unsqueeze(0)  # (1, T_plan, D)
-
-        plan, plan_mean = lewm_cem_plan(
-            model, cfg,
-            history_pixels_u8=history_pixels_u8,
-            history_actions=history_actions,
-            goal_latents_window=goal_window,
-            init_mean=plan_mean,
-            low=low, high=high,
-            weights=weights,
-            rng=rng_th, device=device,
-        )
-
-        # Receding-horizon warm start.
-        plan_mean = torch.cat([plan_mean[1:], torch.zeros((1, action_dim), device=device)], dim=0)
-
-        action = plan[0].detach().cpu().numpy().astype(np.float32)
-        ts = main_env.step(action)
-        diag = diagnostics(main_env)
-
-        history_frames.append(render_frame(main_env, cfg))
-        history_actions_list.append(action.copy())
-
+    phase = 0
+    env_steps = 0
+    first_step = True
+    bar = tqdm(total=EVAL_STEPS, desc="eval LeWM-CEM", dynamic_ncols=True)
+    bootstrap_steps = min(EVAL_BOOTSTRAP_STEPS, EVAL_STEPS, len(goal_actions_np))
+    for boot in range(bootstrap_steps):
+        action = goal_actions_np[boot].astype(np.float32)
+        video_frames.append(render_video_frame(env))
+        ts = env.step(action)
+        diag = diagnostics(env)
         rewards.append(float(ts.reward or 0.0))
         velocities.append(diag["horizontal_velocity"])
         heights.append(diag["torso_height"])
         uprights.append(diag["torso_upright"])
-
-        goal_ptr = min(goal_ptr + 1, T_goal - 1)
-
-        bar.set_postfix({
-            "ret": f"{sum(rewards):.1f}",
-            "v": f"{diag['horizontal_velocity']:.2f}",
-            "h": f"{diag['torso_height']:.2f}",
-            "g": f"{goal_ptr}/{T_goal}",
-        })
+        actions_out.append(action.copy())
+        phases.append(boot)
+        rhos.append(1.0)
+        orbit_distances.append(0.0)
+        history_frames.append(render_dataset_frame(env))
+        history_actions.append(action.copy())
+        previous_action = torch.from_numpy(action).to(device)
+        env_steps += 1
+        phase = boot + 1
+        bar.update(1)
+        append_jsonl(
+            EVAL_TRACE_PATH,
+            {
+                "step": env_steps,
+                "mode": "bootstrap",
+                "reward": rewards[-1],
+                "return": float(np.sum(rewards)),
+                "height": diag["torso_height"],
+                "upright": diag["torso_upright"],
+                "velocity": diag["horizontal_velocity"],
+                "rho": 1.0,
+                "phase": boot,
+                "action_abs": float(np.mean(np.abs(action))),
+            },
+        )
         if ts.last():
+            env_steps = EVAL_STEPS
             break
-    bar.close()
-    main_env.close()
 
-    out_dir = cfg.out_path()
-    video_path = out_dir / f"eval_cam{cfg.video_camera_id}.mp4"
-    imageio.mimsave(video_path, frames, fps=cfg.video_fps)
+    while env_steps < EVAL_STEPS:
+        current_u8 = torch.from_numpy(np.stack(history_frames[-1:], axis=0)).unsqueeze(0).to(device)
+        current_latent = model.encode({"pixels": preprocess_pixels(current_u8)})["emb"].squeeze(0).squeeze(0)
+        global_phase, current_dist = nearest_goal_phase(current_latent, goal_latents)
+        rho = orbit_rho(current_dist, orbit_sigma)
+        if first_step or rho < PHASE_RELOCK_RHO:
+            phase = global_phase
+        else:
+            phase = phase_match(current_latent, goal_latents, phase, first_step)
+        first_step = False
+        target_latents, prior_actions = goal_window(goal_latents, goal_actions, phase)
+
+        hist_pix = torch.from_numpy(np.stack(history_frames[-HISTORY_SIZE:], axis=0)).unsqueeze(0)
+        hist_act = torch.from_numpy(np.stack(history_actions[-HISTORY_SIZE:], axis=0)).unsqueeze(0)
+        plan = lewm_cem_plan(
+            model,
+            hist_pix,
+            hist_act,
+            target_latents,
+            return_latents,
+            prior_actions,
+            rho,
+            previous_action,
+            low,
+            high,
+            weights,
+            rng,
+            device,
+        )
+
+        action = plan[0].detach().cpu().numpy().astype(np.float32)
+        for _ in range(ACTION_BLOCK):
+            if env_steps >= EVAL_STEPS:
+                break
+            video_frames.append(render_video_frame(env))
+            ts = env.step(action)
+            diag = diagnostics(env)
+            rewards.append(float(ts.reward or 0.0))
+            velocities.append(diag["horizontal_velocity"])
+            heights.append(diag["torso_height"])
+            uprights.append(diag["torso_upright"])
+            actions_out.append(action.copy())
+            phases.append(phase)
+            rhos.append(rho)
+            orbit_distances.append(current_dist)
+            history_frames.append(render_dataset_frame(env))
+            history_actions.append(action.copy())
+            previous_action = torch.from_numpy(action).to(device)
+            env_steps += 1
+            bar.update(1)
+            append_jsonl(
+                EVAL_TRACE_PATH,
+                {
+                    "step": env_steps,
+                    "mode": "cem",
+                    "reward": rewards[-1],
+                    "return": float(np.sum(rewards)),
+                    "height": diag["torso_height"],
+                    "upright": diag["torso_upright"],
+                    "velocity": diag["horizontal_velocity"],
+                    "rho": float(rho),
+                    "distance": float(current_dist),
+                    "phase": int(phase),
+                    "global_phase": int(global_phase),
+                    "action_abs": float(np.mean(np.abs(action))),
+                    "previous_action_abs": float(previous_action.abs().mean().detach().cpu()),
+                },
+            )
+            bar.set_postfix(
+                {
+                    "ret": f"{sum(rewards):.1f}",
+                    "v": f"{diag['horizontal_velocity']:.2f}",
+                    "h": f"{diag['torso_height']:.2f}",
+                    "rho": f"{rho:.2f}",
+                    "phase": phase,
+                }
+            )
+            if ts.last():
+                env_steps = EVAL_STEPS
+                break
+    bar.close()
+    env.close()
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    video_path = OUT_DIR / f"eval_cam{VIDEO_CAMERA_ID}.mp4"
+    imageio.mimsave(video_path, video_frames, fps=VIDEO_FPS)
 
     metrics = {
         "domain": DOMAIN,
         "task": TASK,
-        "policy": "lewm_cem",
+        "policy": "pure_lewm_cem_goal_trajectory",
         "steps": len(rewards),
         "total_return": float(np.sum(rewards)) if rewards else 0.0,
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
         "mean_horizontal_velocity": float(np.nanmean(velocities)) if velocities else float("nan"),
         "mean_torso_height": float(np.nanmean(heights)) if heights else float("nan"),
         "mean_torso_upright": float(np.nanmean(uprights)) if uprights else float("nan"),
-        "video_path": str(video_path),
-        "goal_trajectory": str(goal_path),
-        "config": asdict(cfg),
+        "mean_abs_action": float(np.mean(np.abs(actions_out))) if actions_out else float("nan"),
+        "last_phase": int(phases[-1]) if phases else 0,
+        "mean_orbit_rho": float(np.mean(rhos)) if rhos else float("nan"),
+        "min_orbit_rho": float(np.min(rhos)) if rhos else float("nan"),
+        "mean_goal_distance": float(np.mean(orbit_distances)) if orbit_distances else float("nan"),
+        "orbit_blend_sigma": float(orbit_sigma),
+        "checkpoint": str(ckpt_path),
+        "dataset_dir": str(DATASET_DIR),
+        "train_log": str(TRAIN_LOG_PATH),
+        "eval_trace": str(EVAL_TRACE_PATH),
+        "diagnostics": str(DIAGNOSTICS_PATH),
+        "goal_video": str(OUT_DIR / "goal_trajectory.mp4"),
+        "eval_video": str(video_path),
+        "config": hparams(),
     }
-    with (out_dir / "metrics.json").open("w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"[eval] video -> {video_path}")
-    print(f"[eval] return={metrics['total_return']:.1f}  mean_v={metrics['mean_horizontal_velocity']:.2f}")
+    write_json(OUT_DIR / "metrics.json", metrics)
+    print(
+        f"[eval] return={metrics['total_return']:.1f} "
+        f"mean_v={metrics['mean_horizontal_velocity']:.2f} -> {video_path}"
+    )
     return metrics
 
 
-# ---------------------------------------------------------------------------
-# Entry point.
-# ---------------------------------------------------------------------------
+def main() -> None:
+    if NUM_PREDS != 1:
+        raise ValueError("walker_walk.py currently implements one-step LeWM only; keep NUM_PREDS=1.")
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    print("[cfg]", json.dumps(hparams(), indent=2))
 
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out-dir", type=str, default="outputs/walker_walk")
-    p.add_argument("--num-demo-episodes", type=int, default=None)
-    p.add_argument("--episode-steps", type=int, default=None)
-    p.add_argument("--train-steps", type=int, default=None)
-    p.add_argument("--eval-steps", type=int, default=None)
-    p.add_argument("--skip-data", action="store_true", help="reuse existing oracle data")
-    p.add_argument("--skip-train", action="store_true", help="reuse existing checkpoint")
-    p.add_argument("--no-eval", action="store_true", help="skip the LeWM-CEM evaluation")
-    return p.parse_args()
-
-
-def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
-    if args.seed is not None:
-        cfg.seed = args.seed
-    if args.out_dir is not None:
-        cfg.out_dir = args.out_dir
-    if args.num_demo_episodes is not None:
-        cfg.num_demo_episodes = args.num_demo_episodes
-    if args.episode_steps is not None:
-        cfg.episode_steps = args.episode_steps
-    if args.train_steps is not None:
-        cfg.train_steps = args.train_steps
-    if args.eval_steps is not None:
-        cfg.eval_steps = args.eval_steps
-    return cfg
-
-
-def main():
-    args = parse_args()
-    cfg = apply_overrides(Config(), args)
-    cfg.out_path().mkdir(parents=True, exist_ok=True)
-    print("[cfg]", json.dumps(asdict(cfg), indent=2))
-
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-
-    data_dir = cfg.out_path() / "data"
-    if args.skip_data and data_dir.exists():
-        print(f"[data] skipping generation, using {data_dir}")
-    else:
-        data_dir = generate_dataset(cfg)
-
-    ckpt_path = cfg.out_path() / "ckpt" / "lewm.pt"
-    if args.skip_train and ckpt_path.exists():
-        print(f"[train] skipping training, using {ckpt_path}")
-    else:
-        ckpt_path = train_lewm(cfg, data_dir)
-
-    if args.no_eval:
-        print("[eval] skipped per --no-eval")
-        return
-
-    evaluate_lewm_cem(cfg, ckpt_path, data_dir)
+    build_static_dataset()
+    ckpt_path, action_dim = train_lewm()
+    evaluate_lewm_cem(ckpt_path, action_dim)
 
 
 if __name__ == "__main__":
