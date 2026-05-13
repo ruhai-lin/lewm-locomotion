@@ -1,21 +1,23 @@
 """Clean reference-style LeWM pipeline for dm_control walker/walk.
 
 Run:
-    uv run python walker_walk.py
+    uv run python tasks/walker_walk.py
 
 The script is intentionally split into reusable stages:
 1. Build a static dataset under DATASET_DIR if it does not already exist.
 2. Train LeWM from that dataset with one-step prediction + SIGReg.
-3. Evaluate pure LeWM-CEM against the clean goal trajectory.
+3. Evaluate pure LeWM-CEM with latent state/delta manifold planning.
 
 No MuJoCo oracle, reward, or intervention is used during training or eval.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import multiprocessing as mp
 import os
 import shutil
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
@@ -26,6 +28,10 @@ from typing import Iterable, List, Tuple
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import imageio.v2 as imageio
 import numpy as np
 import torch
@@ -33,7 +39,9 @@ import torch.nn.functional as F
 from dm_control import suite
 from tqdm import tqdm
 
-from model import SIGReg, build_lewm
+from src import lewm
+from src.manifold import LatentManifold, ManifoldConfig, SuccessSegment, build_latent_manifold
+from src.planner import LatentCEMPlanner, PlannerConfig, PlannerWeights
 
 
 # ---------------------------------------------------------------------------
@@ -163,18 +171,19 @@ PREDICTOR_DIM_HEAD = 64
 PREDICTOR_MLP_DIM = 2048
 PREDICTOR_DROPOUT = 0.1
 
-SIGREG_WEIGHT = 0.09
+SIGREG_WEIGHT = 0.07
 SIGREG_KNOTS = 17
 SIGREG_NUM_PROJ = 1024
 TRAIN_BATCH_SIZE = 64
-TRAIN_STEPS = 7000
-TRAIN_NUM_WORKERS = 2
+TRAIN_STEPS = 9000
+TRAIN_NUM_WORKERS = 0
 LR = 5e-5
 WEIGHT_DECAY = 1e-3
 GRAD_CLIP = 1.0
 LOG_EVERY = 50
-TRAIN_ROLLOUT_STEPS = 6
-ROLLOUT_LOSS_WEIGHT = 0.5
+TRAIN_ROLLOUT_STEPS = 16
+ROLLOUT_LOSS_WEIGHT = 1.0
+TRAIN_WINDOW_WEIGHTING = False
 
 
 # ---------------------------------------------------------------------------
@@ -186,30 +195,55 @@ EVAL_STEPS = 400
 EVAL_SEED = SEED
 EVAL_BOOTSTRAP_STEPS = HISTORY_SIZE - 1
 ACTION_BLOCK = 1
-PLAN_BLOCKS = 12
+PLAN_BLOCKS = 16
 PLAN_HORIZON = ACTION_BLOCK * PLAN_BLOCKS
-EVAL_CEM_SAMPLES = 128
-EVAL_CEM_TOPK = 16
-EVAL_CEM_ITERS = 3
-EVAL_CEM_INIT_STD = 0.002
-EVAL_CEM_MIN_STD = 0.0005
+EVAL_CEM_SAMPLES = 256
+EVAL_CEM_TOPK = 32
+EVAL_CEM_ITERS = 4
+EVAL_CEM_INIT_STD = 0.01
+EVAL_CEM_FAR_INIT_STD = 0.45
+EVAL_CEM_MAX_STD = 0.65
+EVAL_CEM_MIN_STD = 0.002
 EVAL_CEM_MOMENTUM = 0.15
+CEM_WARM_START_BLEND = 0.0
+CEM_PRIOR_TIE_REL = 0.0
+CEM_PRIOR_TIE_ABS = 0.05
+RECOVERY_DISTANCE_CENTER = 0.20
+RECOVERY_DISTANCE_TEMPERATURE = 0.07
+RECOVERY_PRESSURE_POWER = 1.4
+RECOVERY_PHASE_CENTER = 40
+RECOVERY_PHASE_TEMPERATURE = 6.0
 
 GOAL_ORBIT_START = 40
-PHASE_SEARCH_WINDOW = 18
-PHASE_MIN_STEP = 1
-PHASE_MAX_STEP = 4
+PHASE_SEARCH_WINDOW = 4
+PHASE_MIN_STEP = 0
+PHASE_MAX_STEP = 0
 TRAJ_DISCOUNT = 0.92
-LATENT_VELOCITY_WEIGHT = 0.5
-ACTION_PRIOR_WEIGHT = 1000.0
-ACTION_SMOOTHNESS_WEIGHT = 0.05
-ACTION_ENERGY_WEIGHT = 0.002
-FAR_CEM_EXTRA_STD = 0.05
+NEAR_DELTA_WEIGHT = 0.5
+W_STATE = 0.2
+W_DELTA = 4.0
+W_SUPPORT_STATE = 0.0
+W_SUPPORT_DELTA = 0.0
+W_NEAR = 0.01
+W_ACTION_PRIOR = 0.1
+W_SMOOTH = 0.1
+W_FAR_SMOOTH = 0.015
+W_ENERGY = 0.002
 ORBIT_BLEND_SIGMA_MULT = 8.0
 ORBIT_BLEND_SIGMA_MIN = 0.025
 ORBIT_BLEND_SIGMA_MAX = 0.35
 PHASE_RELOCK_RHO = -1.0
-RETURN_TERMINAL_WEIGHT = 0.75
+GOAL_MANIFOLD_MIN_REWARD = 0.85
+GOAL_MANIFOLD_MIN_HEIGHT = 1.05
+GOAL_MANIFOLD_MIN_UPRIGHT = 0.85
+GOAL_MANIFOLD_MIN_VELOCITY = 0.4
+SUPPORT_TAIL_STABLE_STEPS = 12
+SUPPORT_MIN_MASK_FRAMES = PLAN_HORIZON + 1
+MANIFOLD_MAX_STATE_POINTS = 4096
+MANIFOLD_MAX_DELTA_POINTS = 4096
+MANIFOLD_MAX_SEGMENTS = 4096
+MANIFOLD_COST_SCALE_MIN = 1e-4
+ROLLOUT_DIAGNOSTIC_HORIZONS = [1, 4, 8, 16]
 
 
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
@@ -1104,60 +1138,11 @@ def pick_best_clean_episode(paths: list[Path]) -> Path:
 
 
 def preprocess_pixels(pixels: torch.Tensor) -> torch.Tensor:
-    pixels = pixels.float() / 255.0
-    pixels = pixels.permute(0, 1, 4, 2, 3).contiguous()
-    if pixels.size(-1) != IMAGE_SIZE or pixels.size(-2) != IMAGE_SIZE:
-        b, t = pixels.shape[:2]
-        pixels = pixels.view(b * t, *pixels.shape[2:])
-        pixels = F.interpolate(
-            pixels,
-            size=(IMAGE_SIZE, IMAGE_SIZE),
-            mode="bilinear",
-            align_corners=False,
-        )
-        pixels = pixels.view(b, t, *pixels.shape[1:])
-    return (pixels - _IMAGENET_MEAN.to(pixels)) / _IMAGENET_STD.to(pixels)
+    return lewm.preprocess_pixels(pixels, IMAGE_SIZE)
 
 
-class WalkerWindowDataset(torch.utils.data.Dataset):
-    """Contiguous windows where action[t] predicts pixels[t+1]."""
-
-    def __init__(self, dataset_dir: Path):
-        self.window_pixels = HISTORY_SIZE + max(NUM_PREDS, TRAIN_ROLLOUT_STEPS)
-        self.window_actions = self.window_pixels - 1
-        self.episodes: list[dict[str, np.ndarray]] = []
-        for path in sorted(dataset_dir.glob("episode_*.npz")):
-            with np.load(path) as ep:
-                pixels = ep["pixels"]
-                actions = ep["actions"].astype(np.float32)
-            if len(pixels) >= self.window_pixels and len(actions) >= self.window_actions:
-                self.episodes.append({"pixels": pixels, "actions": actions})
-
-        self.index: list[tuple[int, int]] = []
-        for ep_idx, ep in enumerate(self.episodes):
-            max_start = min(
-                len(ep["pixels"]) - self.window_pixels,
-                len(ep["actions"]) - self.window_actions,
-            )
-            for start in range(max_start + 1):
-                self.index.append((ep_idx, start))
-
-        if not self.index:
-            raise RuntimeError(f"No valid training windows in {dataset_dir}")
-
-    def __len__(self) -> int:
-        return len(self.index)
-
-    def __getitem__(self, idx: int):
-        ep_idx, start = self.index[idx]
-        ep = self.episodes[ep_idx]
-        pixels = ep["pixels"][start : start + self.window_pixels]
-        actions = ep["actions"][start : start + self.window_actions]
-        return torch.from_numpy(pixels), torch.from_numpy(actions)
-
-
-def new_model(action_dim: int, device: torch.device):
-    return build_lewm(
+def model_config(action_dim: int) -> lewm.LeWMModelConfig:
+    return lewm.LeWMModelConfig(
         action_dim=action_dim,
         frameskip=FRAMESKIP,
         history_size=HISTORY_SIZE,
@@ -1170,166 +1155,68 @@ def new_model(action_dim: int, device: torch.device):
         predictor_dim_head=PREDICTOR_DIM_HEAD,
         predictor_mlp_dim=PREDICTOR_MLP_DIM,
         predictor_dropout=PREDICTOR_DROPOUT,
-    ).to(device)
+    )
 
 
-def train_autocast(device: torch.device):
-    if device.type == "cuda":
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    return nullcontext()
+def train_config() -> lewm.LeWMTrainConfig:
+    return lewm.LeWMTrainConfig(
+        num_preds=NUM_PREDS,
+        rollout_steps=TRAIN_ROLLOUT_STEPS,
+        rollout_loss_weight=ROLLOUT_LOSS_WEIGHT,
+        sigreg_weight=SIGREG_WEIGHT,
+        sigreg_knots=SIGREG_KNOTS,
+        sigreg_num_proj=SIGREG_NUM_PROJ,
+        batch_size=TRAIN_BATCH_SIZE,
+        train_steps=TRAIN_STEPS,
+        num_workers=TRAIN_NUM_WORKERS,
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+        grad_clip=GRAD_CLIP,
+        log_every=LOG_EVERY,
+    )
 
 
-def lewm_one_step_loss(
-    model,
-    sigreg: SIGReg,
-    pixels: torch.Tensor,
-    actions: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    actions = torch.nan_to_num(actions, 0.0)
-    info = model.encode({"pixels": pixels, "action": actions[:, :HISTORY_SIZE]})
-    emb = info["emb"]
-    act_emb = info["act_emb"]
-
-    ctx_emb = emb[:, :HISTORY_SIZE]
-    target_emb = emb[:, 1 : HISTORY_SIZE + 1]
-    pred_emb = model.predict(ctx_emb, act_emb[:, :HISTORY_SIZE])
-    pred_loss = (pred_emb - target_emb).pow(2).mean()
-
-    rollout_steps = min(TRAIN_ROLLOUT_STEPS, pixels.size(1) - HISTORY_SIZE)
-    hist_actions = torch.zeros_like(actions[:, :HISTORY_SIZE])
-    if HISTORY_SIZE > 1:
-        hist_actions[:, 1:] = actions[:, : HISTORY_SIZE - 1]
-    future_actions = actions[:, HISTORY_SIZE - 1 : HISTORY_SIZE - 1 + rollout_steps]
-    rollout_pred = aligned_rollout_latents(
-        model,
-        pixels[:, :HISTORY_SIZE],
-        hist_actions,
-        future_actions.unsqueeze(1),
-    ).squeeze(1)
-    rollout_target = emb[:, HISTORY_SIZE : HISTORY_SIZE + rollout_steps]
-    rollout_loss = (rollout_pred - rollout_target).pow(2).mean()
-
-    sigreg_loss = sigreg(emb.transpose(0, 1))
-    loss = pred_loss + ROLLOUT_LOSS_WEIGHT * rollout_loss + SIGREG_WEIGHT * sigreg_loss
-    return {
-        "loss": loss,
-        "pred_loss": pred_loss.detach(),
-        "rollout_loss": rollout_loss.detach(),
-        "sigreg_loss": sigreg_loss.detach(),
-    }
+def walker_window_weight(ep: dict[str, np.ndarray], start: int, window_pixels: int) -> float:
+    """Task-adapter weighting; src only sees the resulting windows."""
+    end = min(start + window_pixels - 1, len(ep["pixels"]) - 1)
+    weight = 1.0
+    meta = metadata_from_array_dict(ep)
+    if bool(meta.get("noisy", False)):
+        weight *= 2.0
+    if meta.get("kind") == "scripted_recovery":
+        weight *= 4.0
+    if "torso_height" in ep:
+        metric_start = max(start - 1, 0)
+        metric_end = max(end - 1, metric_start + 1)
+        h = ep["torso_height"][metric_start:metric_end]
+        if len(h) and float(np.nanmin(h)) < RECOVERY_MAX_MIN_HEIGHT:
+            weight *= 3.0
+    if "torso_upright" in ep:
+        metric_start = max(start - 1, 0)
+        metric_end = max(end - 1, metric_start + 1)
+        up = ep["torso_upright"][metric_start:metric_end]
+        if len(up) and float(np.nanmin(up)) < RECOVERY_MAX_MIN_UPRIGHT:
+            weight *= 2.0
+    return weight
 
 
 def train_lewm() -> tuple[Path, int]:
-    dataset = WalkerWindowDataset(DATASET_DIR)
-    action_dim = int(dataset.episodes[0]["actions"].shape[1])
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=TRAIN_BATCH_SIZE,
-        shuffle=True,
-        drop_last=True,
-        num_workers=TRAIN_NUM_WORKERS,
-        persistent_workers=TRAIN_NUM_WORKERS > 0,
-        pin_memory=torch.cuda.is_available(),
+    with np.load(next(iter(sorted(DATASET_DIR.glob("episode_*.npz"))))) as ep:
+        action_dim = int(ep["actions"].shape[1])
+    return lewm.train_lewm(
+        dataset_dir=DATASET_DIR,
+        ckpt_path=CKPT_DIR / "lewm.pt",
+        train_log_path=TRAIN_LOG_PATH,
+        model_cfg=model_config(action_dim),
+        train_cfg=train_config(),
+        hparams=hparams(),
+        append_jsonl=append_jsonl,
+        window_weight_fn=walker_window_weight if TRAIN_WINDOW_WEIGHTING else None,
     )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    model = new_model(action_dim, device)
-    sigreg = SIGReg(knots=SIGREG_KNOTS, num_proj=SIGREG_NUM_PROJ).to(device)
-    optim = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(
-        f"[train] device={device} params={n_params / 1e6:.2f}M "
-        f"windows={len(dataset)} episodes={len(dataset.episodes)}"
-    )
-    if TRAIN_LOG_PATH.exists():
-        TRAIN_LOG_PATH.unlink()
-    append_jsonl(
-        TRAIN_LOG_PATH,
-        {
-            "event": "start",
-            "device": str(device),
-            "params": n_params,
-            "windows": len(dataset),
-            "episodes": len(dataset.episodes),
-            "config": hparams(),
-        },
-    )
-
-    model.train()
-    step = 0
-    last_log: dict[str, float] = {}
-    pbar = tqdm(total=TRAIN_STEPS, desc="train LeWM", dynamic_ncols=True)
-    while step < TRAIN_STEPS:
-        for pixels_u8, actions in loader:
-            if step >= TRAIN_STEPS:
-                break
-            pixels_u8 = pixels_u8.to(device, non_blocking=True)
-            actions = actions.to(device, non_blocking=True)
-            pixels = preprocess_pixels(pixels_u8)
-
-            with train_autocast(device):
-                losses = lewm_one_step_loss(model, sigreg, pixels, actions)
-
-            optim.zero_grad(set_to_none=True)
-            losses["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optim.step()
-
-            step += 1
-            pbar.update(1)
-            if step % LOG_EVERY == 0 or step == 1:
-                last_log = {
-                    "event": "step",
-                    "step": step,
-                    "loss": float(losses["loss"].detach()),
-                    "pred_loss": float(losses["pred_loss"]),
-                    "rollout_loss": float(losses["rollout_loss"]),
-                    "sigreg_loss": float(losses["sigreg_loss"]),
-                    "lr": float(optim.param_groups[0]["lr"]),
-                }
-                append_jsonl(TRAIN_LOG_PATH, last_log)
-                pbar.set_postfix(
-                    {
-                        "loss": f"{float(losses['loss'].detach()):.4f}",
-                        "pred": f"{float(losses['pred_loss']):.4f}",
-                        "roll": f"{float(losses['rollout_loss']):.4f}",
-                        "sig": f"{float(losses['sigreg_loss']):.4f}",
-                    }
-                )
-    pbar.close()
-
-    CKPT_DIR.mkdir(parents=True, exist_ok=True)
-    ckpt_path = CKPT_DIR / "lewm.pt"
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "action_dim": action_dim,
-            "config": hparams(),
-        },
-        ckpt_path,
-    )
-    print(f"[train] saved -> {ckpt_path}")
-    append_jsonl(
-        TRAIN_LOG_PATH,
-        {
-            "event": "done",
-            "step": step,
-            "checkpoint": str(ckpt_path),
-            "last_log": last_log,
-        },
-    )
-    return ckpt_path, action_dim
 
 
 def load_lewm(ckpt_path: Path, action_dim: int):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = new_model(action_dim, device)
-    sd = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(sd["state_dict"], strict=True)
-    model.eval()
-    model.requires_grad_(False)
-    return model, device
+    return lewm.load_lewm(ckpt_path, model_config(action_dim))
 
 
 # ---------------------------------------------------------------------------
@@ -1339,12 +1226,7 @@ def load_lewm(ckpt_path: Path, action_dim: int):
 
 @torch.no_grad()
 def encode_frames(model, pixels: np.ndarray, device: torch.device, chunk: int = 128) -> torch.Tensor:
-    chunks: list[torch.Tensor] = []
-    for start in range(0, len(pixels), chunk):
-        batch = torch.from_numpy(pixels[start : start + chunk]).unsqueeze(0).to(device)
-        emb = model.encode({"pixels": preprocess_pixels(batch)})["emb"].squeeze(0)
-        chunks.append(emb)
-    return torch.cat(chunks, dim=0)
+    return lewm.encode_frames(model, pixels, device, IMAGE_SIZE, chunk=chunk)
 
 
 def frame_index(phase: int, goal_len: int) -> int:
@@ -1412,13 +1294,235 @@ def estimate_orbit_sigma(goal_latents: torch.Tensor) -> float:
 
 @torch.no_grad()
 def nearest_goal_phase(current_latent: torch.Tensor, goal_latents: torch.Tensor) -> tuple[int, float]:
-    dist = (goal_latents.float() - current_latent.view(1, -1).float()).pow(2).mean(dim=-1)
+    start = min(GOAL_ORBIT_START, goal_latents.size(0) - 1)
+    stable_latents = goal_latents[start:].float()
+    dist = (stable_latents - current_latent.view(1, -1).float()).pow(2).mean(dim=-1)
     idx = int(torch.argmin(dist).item())
-    return idx, float(dist[idx].item())
+    return start + idx, float(dist[idx].item())
+
+
+@torch.no_grad()
+def nearest_goal_distance(
+    current_latent: torch.Tensor,
+    goal_latents: torch.Tensor,
+    *,
+    start: int = 0,
+) -> float:
+    start = min(max(int(start), 0), goal_latents.size(0) - 1)
+    candidates = goal_latents[start:].float()
+    dist = (candidates - current_latent.view(1, -1).float()).pow(2).mean(dim=-1)
+    return float(dist.min().item())
 
 
 def orbit_rho(distance: float, sigma: float) -> float:
     return float(np.exp(-distance / max(sigma, 1e-6)))
+
+
+def recovery_pressure(distance: float, phase: int) -> tuple[float, float]:
+    """Continuous non-linear pressure to search farther from the action prior."""
+    x = (float(distance) - RECOVERY_DISTANCE_CENTER) / max(RECOVERY_DISTANCE_TEMPERATURE, 1e-6)
+    distance_pressure = 1.0 / (1.0 + np.exp(-x))
+    distance_pressure = float(np.clip(distance_pressure, 0.0, 1.0) ** RECOVERY_PRESSURE_POWER)
+    phase_x = (float(phase) - RECOVERY_PHASE_CENTER) / max(RECOVERY_PHASE_TEMPERATURE, 1e-6)
+    phase_gate = float(1.0 / (1.0 + np.exp(-phase_x)))
+    return float(distance_pressure * phase_gate), phase_gate
+
+
+GoalManifold = LatentManifold
+
+
+def metadata_json(ep) -> dict:
+    if "metadata" not in ep.files:
+        return {}
+    raw = ep["metadata"]
+    if hasattr(raw, "item"):
+        raw = raw.item()
+    try:
+        return json.loads(str(raw))
+    except json.JSONDecodeError:
+        return {}
+
+
+def metadata_from_array_dict(ep: dict[str, np.ndarray]) -> dict:
+    if "metadata" not in ep:
+        return {}
+    raw = ep["metadata"]
+    if hasattr(raw, "item"):
+        raw = raw.item()
+    try:
+        return json.loads(str(raw))
+    except json.JSONDecodeError:
+        return {}
+
+
+def stable_frame_mask(ep, num_frames: int) -> np.ndarray:
+    action_steps = max(num_frames - 1, 1)
+    frame_ids = np.arange(num_frames)
+    metric_ids = np.clip(frame_ids - 1, 0, action_steps - 1)
+    mask = frame_ids >= min(GOAL_ORBIT_START, num_frames - 1)
+    for key, threshold in (
+        ("rewards", GOAL_MANIFOLD_MIN_REWARD),
+        ("torso_height", GOAL_MANIFOLD_MIN_HEIGHT),
+        ("torso_upright", GOAL_MANIFOLD_MIN_UPRIGHT),
+        ("horizontal_velocity", GOAL_MANIFOLD_MIN_VELOCITY),
+    ):
+        if key in ep.files:
+            values = ep[key]
+            ids = np.clip(metric_ids, 0, len(values) - 1)
+            mask = mask & (values[ids] >= threshold)
+    return mask
+
+
+def is_high_quality_clean_episode(path: Path) -> bool:
+    with np.load(path) as ep:
+        meta = metadata_json(ep)
+        if meta.get("kind") is not None:
+            return False
+        if bool(meta.get("noisy", False)):
+            return False
+        if len(ep["pixels"]) < GOAL_ORBIT_START + PLAN_HORIZON + 2:
+            return False
+        if "rewards" not in ep.files or "torso_height" not in ep.files:
+            return False
+        tail = slice(max(0, len(ep["rewards"]) - QUALITY_TAIL_STEPS), None)
+        return (
+            float(ep["rewards"][tail].mean()) >= TAIL_MIN_REWARD
+            and float(ep["torso_height"][tail].mean()) >= TAIL_MIN_HEIGHT
+            and float(ep["torso_upright"][tail].mean()) >= TAIL_MIN_UPRIGHT
+            and float(ep["horizontal_velocity"][tail].mean()) >= TAIL_MIN_VELOCITY
+        )
+
+
+def support_transition_mask(ep, num_frames: int) -> np.ndarray:
+    """Task adapter: expose successful transition segments to src manifold code."""
+    stable = stable_frame_mask(ep, num_frames)
+    if stable.sum() < SUPPORT_MIN_MASK_FRAMES:
+        return np.zeros(num_frames, dtype=bool)
+    tail_n = min(SUPPORT_TAIL_STABLE_STEPS, num_frames)
+    if not bool(stable[-tail_n:].all()):
+        return np.zeros(num_frames, dtype=bool)
+
+    meta = metadata_json(ep)
+    action_steps = max(num_frames - 1, 1)
+    has_off_manifold = bool(meta.get("kind") == "scripted_recovery" or meta.get("noisy", False))
+    if "torso_height" in ep.files:
+        has_off_manifold = has_off_manifold or float(np.nanmin(ep["torso_height"][:action_steps])) < RECOVERY_MAX_MIN_HEIGHT
+    if "torso_upright" in ep.files:
+        has_off_manifold = has_off_manifold or float(np.nanmin(ep["torso_upright"][:action_steps])) < RECOVERY_MAX_MIN_UPRIGHT
+    if not has_off_manifold:
+        return np.zeros(num_frames, dtype=bool)
+
+    first_stable = int(np.argmax(stable))
+    if meta.get("kind") == "scripted_recovery":
+        start = 0
+    else:
+        start = max(min(GOAL_ORBIT_START, num_frames - 1), first_stable - PLAN_HORIZON)
+    mask = np.zeros(num_frames, dtype=bool)
+    mask[start:] = True
+    return mask
+
+
+def subsample_rows(values: torch.Tensor, max_rows: int) -> torch.Tensor:
+    if values.size(0) <= max_rows:
+        return values
+    idx = torch.linspace(
+        0,
+        values.size(0) - 1,
+        max_rows,
+        device=values.device,
+        dtype=torch.float32,
+    ).round().long()
+    return values.index_select(0, idx)
+
+
+def contiguous_motion_segments(
+    latents: torch.Tensor,
+    mask: torch.Tensor,
+    horizon: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    state_segments = []
+    delta_segments = []
+    max_start = latents.size(0) - horizon - 1
+    for start in range(max_start + 1):
+        if bool(mask[start : start + horizon + 1].all()):
+            state_segments.append(latents[start + 1 : start + horizon + 1])
+            delta_segments.append(latents[start + 1 : start + horizon + 1] - latents[start : start + horizon])
+    if not state_segments:
+        empty = latents.new_zeros((0, horizon, latents.size(-1)))
+        return empty, empty
+    return torch.stack(state_segments, dim=0), torch.stack(delta_segments, dim=0)
+
+
+def tensor_stats(values: torch.Tensor) -> dict:
+    values = values.detach().float().cpu()
+    if values.numel() == 0:
+        return {}
+    return {
+        "min": float(values.min().item()),
+        "median": float(values.median().item()),
+        "mean": float(values.mean().item()),
+        "p95": float(torch.quantile(values, 0.95).item()),
+        "max": float(values.max().item()),
+    }
+
+
+@torch.no_grad()
+def nearest_neighbor_mse_stats(values: torch.Tensor, max_points: int = 1024) -> dict:
+    values = subsample_rows(values.float(), max_points)
+    if values.size(0) < 2:
+        return {}
+    dist = torch.cdist(values, values).pow(2).div(values.size(-1))
+    dist.fill_diagonal_(float("inf"))
+    return tensor_stats(dist.min(dim=1).values)
+
+
+@torch.no_grad()
+def build_goal_manifold(
+    model,
+    goal_pixels: np.ndarray,
+    goal_ep,
+    device: torch.device,
+) -> LatentManifold:
+    segments: list[SuccessSegment] = []
+    goal_meta = metadata_json(goal_ep)
+    skipped_source = str(goal_meta.get("source_episode", ""))
+
+    def add_source(name: str, ep, pixels: np.ndarray, role: str, mask: np.ndarray) -> None:
+        if int(mask.sum()) < SUPPORT_MIN_MASK_FRAMES:
+            return
+        segments.append(
+            SuccessSegment(
+                name=name,
+                pixels=pixels.copy(),
+                mask=mask.astype(bool),
+                role=role,
+                metadata=metadata_json(ep),
+            )
+        )
+
+    add_source("goal_trajectory", goal_ep, goal_pixels, "goal", stable_frame_mask(goal_ep, len(goal_pixels)))
+    for path in sorted(DATASET_DIR.glob("episode_*.npz")):
+        if path.name == skipped_source:
+            continue
+        with np.load(path) as ep:
+            pixels = ep["pixels"]
+            if is_high_quality_clean_episode(path):
+                add_source(path.name, ep, pixels, "goal", stable_frame_mask(ep, len(pixels)))
+            support_mask = support_transition_mask(ep, len(pixels))
+            add_source(path.name, ep, pixels, "support", support_mask)
+
+    return build_latent_manifold(
+        segments,
+        encode_frames=lambda pixels: encode_frames(model, pixels, device),
+        config=ManifoldConfig(
+            horizon=PLAN_HORIZON,
+            max_state_points=MANIFOLD_MAX_STATE_POINTS,
+            max_delta_points=MANIFOLD_MAX_DELTA_POINTS,
+            max_segments=MANIFOLD_MAX_SEGMENTS,
+            cost_scale_min=MANIFOLD_COST_SCALE_MIN,
+        ),
+        device=device,
+    )
 
 
 @torch.no_grad()
@@ -1432,7 +1536,10 @@ def rollout_prediction_diagnostics(
     action_dim = int(goal_actions_np.shape[1])
     starts = [0, 1, 5, 20, 40]
     out: dict[str, dict] = {}
-    max_horizon = min(PLAN_HORIZON, len(goal_actions_np) - HISTORY_SIZE)
+    max_horizon = min(max(ROLLOUT_DIAGNOSTIC_HORIZONS), len(goal_actions_np) - HISTORY_SIZE)
+    horizon_values: dict[int, list[float]] = {
+        int(h): [] for h in ROLLOUT_DIAGNOSTIC_HORIZONS if h <= max_horizon
+    }
     for start in starts:
         if start + HISTORY_SIZE + max_horizon >= len(goal_pixels):
             continue
@@ -1455,10 +1562,16 @@ def rollout_prediction_diagnostics(
         ).squeeze(0).squeeze(0)
         target = goal_latents[start + HISTORY_SIZE : start + HISTORY_SIZE + max_horizon]
         mse = (pred.float() - target.float()).pow(2).mean(dim=-1).detach().cpu().numpy()
+        horizon_mse = {}
+        for horizon in horizon_values:
+            value = float(mse[horizon - 1])
+            horizon_mse[str(horizon)] = value
+            horizon_values[horizon].append(value)
         out[f"true_history_{start}"] = {
             "first": float(mse[0]),
             "terminal": float(mse[-1]),
             "mean": float(mse.mean()),
+            "horizon_mse": horizon_mse,
         }
 
     repeated = torch.from_numpy(
@@ -1480,8 +1593,16 @@ def rollout_prediction_diagnostics(
         "first": float(mse[0]),
         "terminal": float(mse[-1]),
         "mean": float(mse.mean()),
+        "horizon_mse": {
+            str(horizon): float(mse[horizon - 1]) for horizon in horizon_values
+        },
     }
-    return out
+    return {
+        "cases": out,
+        "mean_by_horizon": {
+            str(horizon): float(np.mean(values)) for horizon, values in horizon_values.items() if values
+        },
+    }
 
 
 def block_actions_from_step_actions(actions: torch.Tensor) -> torch.Tensor:
@@ -1501,40 +1622,13 @@ def aligned_rollout_latents(
     history_actions: torch.Tensor,
     future_actions: torch.Tensor,
 ) -> torch.Tensor:
-    """Roll out one-step LeWM dynamics with correct action alignment.
-
-    history_actions is shifted so action_buf[:, -H+1:] are the known actions
-    between context frames. The current-frame action is the candidate
-    future_actions[:, :, 0], so it affects the first prediction.
-    """
-    b, h = history_pixels.shape[:2]
-    samples, horizon = future_actions.shape[1:3]
-    hist = model.encode({"pixels": history_pixels})
-    emb = hist["emb"].unsqueeze(1).expand(b, samples, h, -1).reshape(b * samples, h, -1)
-    action_buf = (
-        history_actions.unsqueeze(1)
-        .expand(b, samples, h, -1)
-        .reshape(b * samples, h, -1)
-        .float()
+    return lewm.aligned_rollout_latents(
+        model,
+        history_pixels,
+        history_actions,
+        future_actions,
+        history_size=HISTORY_SIZE,
     )
-    future = future_actions.reshape(b * samples, horizon, -1).float()
-
-    preds = []
-    for t in range(horizon):
-        emb_in = emb[:, -HISTORY_SIZE:]
-        next_action = future[:, t : t + 1]
-        if HISTORY_SIZE == 1:
-            raw_actions = next_action
-        else:
-            raw_actions = torch.cat([action_buf[:, -HISTORY_SIZE + 1 :], next_action], dim=1)
-        act_emb = model.action_encoder(raw_actions)
-        pred = model.predict(emb_in, act_emb)[:, -1:]
-        preds.append(pred)
-        emb = torch.cat([emb, pred], dim=1)
-        action_buf = torch.cat([action_buf, next_action], dim=1)
-
-    pred = torch.cat(preds, dim=1)
-    return pred.reshape(b, samples, horizon, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -1542,117 +1636,123 @@ def aligned_rollout_latents(
 # ---------------------------------------------------------------------------
 
 
+def weighted_horizon_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    w = weights[: values.size(1)].to(values)
+    return (values * w.view(1, -1)).sum(dim=1) / w.sum().clamp_min(1e-8)
+
+
+def nearest_segment_mse(
+    sequence: torch.Tensor,
+    segments: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    samples, horizon, dim = sequence.shape
+    w = weights[:horizon].to(sequence).sqrt().view(1, horizon, 1)
+    flat_sequence = (sequence.float() * w).reshape(samples, horizon * dim)
+    flat_segments = (segments.float() * w).reshape(segments.size(0), horizon * dim)
+    denom = weights[:horizon].to(sequence).sum().clamp_min(1e-8) * dim
+    return torch.cdist(flat_sequence, flat_segments).pow(2).min(dim=1).values.div(denom)
+
+
 @torch.no_grad()
 def lewm_cem_plan(
     model,
     history_pixels_u8: torch.Tensor,
     history_actions: torch.Tensor,
+    current_latent: torch.Tensor,
     target_latents: torch.Tensor,
-    return_latents: torch.Tensor,
+    goal_manifold: GoalManifold,
     prior_actions: torch.Tensor,
-    rho: float,
     previous_action: torch.Tensor,
     low: torch.Tensor,
     high: torch.Tensor,
     weights: torch.Tensor,
     rng: torch.Generator,
     device: torch.device,
-) -> torch.Tensor:
-    action_dim = low.numel()
-    prior_blocks = block_actions_from_step_actions(prior_actions).to(device)
-    rho_t = torch.tensor(float(rho), device=device, dtype=torch.float32).clamp(0.0, 1.0)
-    mean = torch.clamp(prior_blocks, low, high)
-    std_scale = EVAL_CEM_INIT_STD + (1.0 - float(rho_t)) * FAR_CEM_EXTRA_STD
-    std = torch.full_like(mean, std_scale)
-
-    history_pixels = preprocess_pixels(history_pixels_u8.to(device))
-    history_actions = history_actions.to(device)
-    target_latents = target_latents.to(device)
-    return_latents = return_latents.to(device).float()
-
-    best_plan: torch.Tensor | None = None
-    best_cost = float("inf")
-    for _ in range(EVAL_CEM_ITERS):
-        eps = torch.randn((EVAL_CEM_SAMPLES, PLAN_BLOCKS, action_dim), generator=rng, device=device)
-        block_samples = torch.clamp(mean.unsqueeze(0) + std.unsqueeze(0) * eps, low, high)
-        block_samples[0] = prior_blocks
-        block_samples[1] = mean
-        step_samples = block_samples.repeat_interleave(ACTION_BLOCK, dim=1)
-
-        pred = aligned_rollout_latents(
-            model,
-            history_pixels,
-            history_actions,
-            step_samples.unsqueeze(0),
-        ).squeeze(0)
-
-        goal = target_latents.unsqueeze(0).expand_as(pred)
-        diff = (pred.float() - goal.float()).pow(2).mean(dim=-1)
-        phase_cost = (diff * weights).mean(dim=1)
-        if LATENT_VELOCITY_WEIGHT > 0 and PLAN_HORIZON > 1:
-            pred_vel = pred[:, 1:] - pred[:, :-1]
-            goal_vel = goal[:, 1:] - goal[:, :-1]
-            vel_diff = (pred_vel.float() - goal_vel.float()).pow(2).mean(dim=-1)
-            phase_cost = phase_cost + LATENT_VELOCITY_WEIGHT * (vel_diff * weights[1:]).mean(dim=1)
-
-        samples, horizon, dim = pred.shape
-        return_dist = torch.cdist(
-            pred.reshape(samples * horizon, dim).float(),
-            return_latents,
-        ).pow(2).min(dim=1).values.div(dim).reshape(samples, horizon)
-        return_cost = (return_dist * weights).mean(dim=1)
-        return_cost = return_cost + RETURN_TERMINAL_WEIGHT * return_dist[:, -1]
-        cost = rho_t * phase_cost + (1.0 - rho_t) * return_cost
-
-        prior_cost = (block_samples - prior_blocks.unsqueeze(0)).pow(2).mean(dim=(1, 2))
-        prev = torch.cat(
-            [previous_action.view(1, 1, -1).expand(EVAL_CEM_SAMPLES, 1, -1), block_samples[:, :-1]],
-            dim=1,
-        )
-        smooth_cost = (block_samples - prev).pow(2).mean(dim=(1, 2))
-        energy_cost = block_samples.pow(2).mean(dim=(1, 2))
-        cost = (
-            cost
-            + (rho_t * ACTION_PRIOR_WEIGHT) * prior_cost
-            + ACTION_SMOOTHNESS_WEIGHT * smooth_cost
-            + ACTION_ENERGY_WEIGHT * energy_cost
-        )
-
-        topk = min(EVAL_CEM_TOPK, EVAL_CEM_SAMPLES)
-        elite_idx = torch.topk(cost, topk, largest=False).indices
-        elites = block_samples[elite_idx]
-        elite_mean = elites.mean(dim=0)
-        elite_std = elites.std(dim=0, unbiased=False).clamp_min(EVAL_CEM_MIN_STD)
-        mean = (1.0 - EVAL_CEM_MOMENTUM) * elite_mean + EVAL_CEM_MOMENTUM * mean
-        std = elite_std
-
-        i_best = int(torch.argmin(cost).item())
-        if float(cost[i_best]) < best_cost:
-            best_cost = float(cost[i_best])
-            best_plan = block_samples[i_best].clone()
-
-    assert best_plan is not None
-    return best_plan
+    warm_start_blocks: torch.Tensor | None = None,
+    pressure: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    p = float(np.clip(pressure, 0.0, 1.0))
+    init_std = EVAL_CEM_INIT_STD + p * (EVAL_CEM_FAR_INIT_STD - EVAL_CEM_INIT_STD)
+    action_prior_weight = (1.0 - p) * W_ACTION_PRIOR
+    smooth_weight = W_SMOOTH - p * (W_SMOOTH - W_FAR_SMOOTH)
+    planner = LatentCEMPlanner(
+        model,
+        PlannerConfig(
+            history_size=HISTORY_SIZE,
+            action_block=ACTION_BLOCK,
+            plan_blocks=PLAN_BLOCKS,
+            samples=EVAL_CEM_SAMPLES,
+            topk=EVAL_CEM_TOPK,
+            iters=EVAL_CEM_ITERS,
+            init_std=EVAL_CEM_INIT_STD,
+            max_std=EVAL_CEM_MAX_STD,
+            min_std=EVAL_CEM_MIN_STD,
+            momentum=EVAL_CEM_MOMENTUM,
+            warm_start_blend=CEM_WARM_START_BLEND,
+            prior_tie_rel=CEM_PRIOR_TIE_REL,
+            prior_tie_abs=CEM_PRIOR_TIE_ABS,
+            cost_scale_min=MANIFOLD_COST_SCALE_MIN,
+            near_delta_weight=NEAR_DELTA_WEIGHT,
+        ),
+        PlannerWeights(
+            state=W_STATE,
+            delta=W_DELTA,
+            support_state=W_SUPPORT_STATE,
+            support_delta=W_SUPPORT_DELTA,
+            near=W_NEAR,
+            action_prior=W_ACTION_PRIOR,
+            smooth=W_SMOOTH,
+            energy=W_ENERGY,
+        ),
+    )
+    return planner.plan(
+        history_pixels=preprocess_pixels(history_pixels_u8.to(device)),
+        history_actions=history_actions,
+        current_latent=current_latent,
+        target_latents=target_latents,
+        manifold=goal_manifold,
+        prior_actions=prior_actions,
+        previous_action=previous_action,
+        low=low,
+        high=high,
+        horizon_weights=weights,
+        rng=rng,
+        warm_start_blocks=warm_start_blocks,
+        init_std=init_std,
+        action_prior_weight=action_prior_weight,
+        smooth_weight=smooth_weight,
+    )
 
 
 @torch.no_grad()
 def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
     model, device = load_lewm(ckpt_path, action_dim)
     with np.load(DATASET_DIR / "goal_trajectory.npz") as goal:
-        goal_pixels = goal["pixels"]
+        goal_pixels = goal["pixels"].copy()
         goal_actions_np = goal["actions"].astype(np.float32)
+        goal_manifold = build_goal_manifold(model, goal_pixels, goal, device)
 
     goal_latents = encode_frames(model, goal_pixels, device)
     goal_actions = torch.from_numpy(goal_actions_np).to(device)
-    return_start = min(GOAL_ORBIT_START, goal_latents.size(0) - 1)
-    return_latents = goal_latents[return_start:]
     orbit_sigma = estimate_orbit_sigma(goal_latents)
     imageio.mimsave(OUT_DIR / "goal_trajectory.mp4", list(goal_pixels), fps=VIDEO_FPS)
     diagnostics_payload = {
+        "goal_manifold": goal_manifold.diagnostics,
         "rollout_prediction": rollout_prediction_diagnostics(
             model, goal_pixels, goal_actions_np, goal_latents, device
         ),
         "orbit_sigma": float(orbit_sigma),
+        "planner_weights": {
+            "W_STATE": W_STATE,
+            "W_DELTA": W_DELTA,
+            "W_SUPPORT_STATE": W_SUPPORT_STATE,
+            "W_SUPPORT_DELTA": W_SUPPORT_DELTA,
+            "W_NEAR": W_NEAR,
+            "W_ACTION_PRIOR": W_ACTION_PRIOR,
+            "W_SMOOTH": W_SMOOTH,
+            "W_ENERGY": W_ENERGY,
+        },
     }
     write_json(DIAGNOSTICS_PATH, diagnostics_payload)
 
@@ -1687,12 +1787,14 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
     phases: list[int] = []
     rhos: list[float] = []
     orbit_distances: list[float] = []
+    cost_infos: list[dict[str, float]] = []
 
     phase = 0
     env_steps = 0
-    first_step = True
+    warm_start_blocks: torch.Tensor | None = None
     bar = tqdm(total=EVAL_STEPS, desc="eval LeWM-CEM", dynamic_ncols=True)
     bootstrap_steps = min(EVAL_BOOTSTRAP_STEPS, EVAL_STEPS, len(goal_actions_np))
+    first_step = bootstrap_steps == 0
     for boot in range(bootstrap_steps):
         action = goal_actions_np[boot].astype(np.float32)
         video_frames.append(render_video_frame(env))
@@ -1725,6 +1827,26 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
                 "rho": 1.0,
                 "phase": boot,
                 "action_abs": float(np.mean(np.abs(action))),
+                "state_cost": 0.0,
+                "delta_cost": 0.0,
+                "support_state_cost": 0.0,
+                "support_delta_cost": 0.0,
+                "near_cost": 0.0,
+                "prior_cost": 0.0,
+                "smooth_cost": 0.0,
+                "energy_cost": 0.0,
+                "total_cost": 0.0,
+                "state_cost_share": 0.0,
+                "delta_cost_share": 0.0,
+                "support_state_cost_share": 0.0,
+                "support_delta_cost_share": 0.0,
+                "near_cost_share": 0.0,
+                "prior_cost_share": 0.0,
+                "used_prior_guard": 0.0,
+                "prior_total_cost": 0.0,
+                "cem_best_total_cost": 0.0,
+                "prior_cost_improvement": 0.0,
+                "prior_guard_margin": 0.0,
             },
         )
         if ts.last():
@@ -1736,7 +1858,7 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
         current_latent = model.encode({"pixels": preprocess_pixels(current_u8)})["emb"].squeeze(0).squeeze(0)
         global_phase, current_dist = nearest_goal_phase(current_latent, goal_latents)
         rho = orbit_rho(current_dist, orbit_sigma)
-        if first_step or rho < PHASE_RELOCK_RHO:
+        if PHASE_RELOCK_RHO >= 0.0 and rho < PHASE_RELOCK_RHO and phase >= GOAL_ORBIT_START:
             phase = global_phase
         else:
             phase = phase_match(current_latent, goal_latents, phase, first_step)
@@ -1745,26 +1867,32 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
 
         hist_pix = torch.from_numpy(np.stack(history_frames[-HISTORY_SIZE:], axis=0)).unsqueeze(0)
         hist_act = torch.from_numpy(np.stack(history_actions[-HISTORY_SIZE:], axis=0)).unsqueeze(0)
-        plan = lewm_cem_plan(
+        pressure_dist = current_dist
+        pressure, phase_pressure_gate = recovery_pressure(pressure_dist, phase)
+        plan, plan_info = lewm_cem_plan(
             model,
             hist_pix,
             hist_act,
+            current_latent,
             target_latents,
-            return_latents,
+            goal_manifold,
             prior_actions,
-            rho,
             previous_action,
             low,
             high,
             weights,
             rng,
             device,
+            warm_start_blocks,
+            pressure=pressure,
         )
+        warm_start_blocks = torch.cat([plan[1:], plan[-1:]], dim=0).detach()
 
         action = plan[0].detach().cpu().numpy().astype(np.float32)
         for _ in range(ACTION_BLOCK):
             if env_steps >= EVAL_STEPS:
                 break
+            step_phase = phase
             video_frames.append(render_video_frame(env))
             ts = env.step(action)
             diag = diagnostics(env)
@@ -1773,9 +1901,10 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
             heights.append(diag["torso_height"])
             uprights.append(diag["torso_upright"])
             actions_out.append(action.copy())
-            phases.append(phase)
+            phases.append(step_phase)
             rhos.append(rho)
             orbit_distances.append(current_dist)
+            cost_infos.append(plan_info)
             history_frames.append(render_dataset_frame(env))
             history_actions.append(action.copy())
             previous_action = torch.from_numpy(action).to(device)
@@ -1792,11 +1921,15 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
                     "upright": diag["torso_upright"],
                     "velocity": diag["horizontal_velocity"],
                     "rho": float(rho),
+                    "recovery_pressure": float(pressure),
+                    "phase_pressure_gate": float(phase_pressure_gate),
                     "distance": float(current_dist),
-                    "phase": int(phase),
+                    "pressure_distance": float(pressure_dist),
+                    "phase": int(step_phase),
                     "global_phase": int(global_phase),
                     "action_abs": float(np.mean(np.abs(action))),
                     "previous_action_abs": float(previous_action.abs().mean().detach().cpu()),
+                    **plan_info,
                 },
             )
             bar.set_postfix(
@@ -1805,9 +1938,13 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
                     "v": f"{diag['horizontal_velocity']:.2f}",
                     "h": f"{diag['torso_height']:.2f}",
                     "rho": f"{rho:.2f}",
-                    "phase": phase,
+                    "method": (
+                        f"{plan_info['state_cost_share'] + plan_info['delta_cost_share'] + plan_info['support_state_cost_share'] + plan_info['support_delta_cost_share']:.2f}"
+                    ),
+                    "phase": step_phase,
                 }
             )
+            phase += 1
             if ts.last():
                 env_steps = EVAL_STEPS
                 break
@@ -1818,12 +1955,25 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
     video_path = OUT_DIR / f"eval_cam{VIDEO_CAMERA_ID}.mp4"
     imageio.mimsave(video_path, video_frames, fps=VIDEO_FPS)
 
+    def mean_cost_info(key: str) -> float:
+        if not cost_infos:
+            return float("nan")
+        return float(np.mean([info.get(key, 0.0) for info in cost_infos]))
+
+    mean_state_delta_share = mean_cost_info("state_cost_share") + mean_cost_info("delta_cost_share")
+    mean_support_share = (
+        mean_cost_info("support_state_cost_share")
+        + mean_cost_info("support_delta_cost_share")
+    )
+    mean_method_share = mean_state_delta_share + mean_support_share
+    mean_near_prior_share = mean_cost_info("near_cost_share") + mean_cost_info("prior_cost_share")
+    total_return = float(np.sum(rewards)) if rewards else 0.0
     metrics = {
         "domain": DOMAIN,
         "task": TASK,
-        "policy": "pure_lewm_cem_goal_trajectory",
+        "policy": "pure_lewm_cem_latent_delta_manifold",
         "steps": len(rewards),
-        "total_return": float(np.sum(rewards)) if rewards else 0.0,
+        "total_return": total_return,
         "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
         "mean_horizontal_velocity": float(np.nanmean(velocities)) if velocities else float("nan"),
         "mean_torso_height": float(np.nanmean(heights)) if heights else float("nan"),
@@ -1834,6 +1984,55 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
         "min_orbit_rho": float(np.min(rhos)) if rhos else float("nan"),
         "mean_goal_distance": float(np.mean(orbit_distances)) if orbit_distances else float("nan"),
         "orbit_blend_sigma": float(orbit_sigma),
+        "planner_weights": {
+            "W_STATE": W_STATE,
+            "W_DELTA": W_DELTA,
+            "W_SUPPORT_STATE": W_SUPPORT_STATE,
+            "W_SUPPORT_DELTA": W_SUPPORT_DELTA,
+            "W_NEAR": W_NEAR,
+            "W_ACTION_PRIOR": W_ACTION_PRIOR,
+            "W_SMOOTH": W_SMOOTH,
+            "W_ENERGY": W_ENERGY,
+        },
+        "mean_state_cost": mean_cost_info("state_cost"),
+        "mean_delta_cost": mean_cost_info("delta_cost"),
+        "mean_support_state_cost": mean_cost_info("support_state_cost"),
+        "mean_support_delta_cost": mean_cost_info("support_delta_cost"),
+        "mean_near_cost": mean_cost_info("near_cost"),
+        "mean_prior_cost": mean_cost_info("prior_cost"),
+        "mean_smooth_cost": mean_cost_info("smooth_cost"),
+        "mean_energy_cost": mean_cost_info("energy_cost"),
+        "mean_total_cost": mean_cost_info("total_cost"),
+        "mean_state_cost_share": mean_cost_info("state_cost_share"),
+        "mean_delta_cost_share": mean_cost_info("delta_cost_share"),
+        "mean_support_state_cost_share": mean_cost_info("support_state_cost_share"),
+        "mean_support_delta_cost_share": mean_cost_info("support_delta_cost_share"),
+        "mean_near_cost_share": mean_cost_info("near_cost_share"),
+        "mean_prior_cost_share": mean_cost_info("prior_cost_share"),
+        "prior_guard_used_rate": mean_cost_info("used_prior_guard"),
+        "mean_prior_cost_improvement": mean_cost_info("prior_cost_improvement"),
+        "mean_prior_guard_margin": mean_cost_info("prior_guard_margin"),
+        "mean_state_delta_cost_share": mean_state_delta_share,
+        "mean_support_cost_share": mean_support_share,
+        "mean_method_cost_share": mean_method_share,
+        "mean_near_prior_cost_share": mean_near_prior_share,
+        "state_delta_dominant": bool(mean_state_delta_share > mean_near_prior_share),
+        "method_cost_dominant": bool(mean_method_share > mean_near_prior_share),
+        "sanity_return_ok": bool(total_return >= 100.0),
+        "goal_manifold": {
+            "state_points": goal_manifold.diagnostics["state_points"],
+            "delta_points": goal_manifold.diagnostics["delta_points"],
+            "state_segments": goal_manifold.diagnostics["state_segments"],
+            "delta_segments": goal_manifold.diagnostics["delta_segments"],
+            "support_state_points": goal_manifold.diagnostics["support_state_points"],
+            "support_delta_points": goal_manifold.diagnostics["support_delta_points"],
+            "support_state_segments": goal_manifold.diagnostics["support_state_segments"],
+            "support_delta_segments": goal_manifold.diagnostics["support_delta_segments"],
+            "state_scale": goal_manifold.diagnostics["state_scale"],
+            "delta_scale": goal_manifold.diagnostics["delta_scale"],
+            "support_state_scale": goal_manifold.diagnostics["support_state_scale"],
+            "support_delta_scale": goal_manifold.diagnostics["support_delta_scale"],
+        },
         "checkpoint": str(ckpt_path),
         "dataset_dir": str(DATASET_DIR),
         "train_log": str(TRAIN_LOG_PATH),
@@ -1846,14 +2045,13 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
     write_json(OUT_DIR / "metrics.json", metrics)
     print(
         f"[eval] return={metrics['total_return']:.1f} "
-        f"mean_v={metrics['mean_horizontal_velocity']:.2f} -> {video_path}"
+        f"mean_v={metrics['mean_horizontal_velocity']:.2f} "
+        f"method_share={metrics['mean_method_cost_share']:.2f} -> {video_path}"
     )
     return metrics
 
 
 def main() -> None:
-    if NUM_PREDS != 1:
-        raise ValueError("walker_walk.py currently implements one-step LeWM only; keep NUM_PREDS=1.")
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
