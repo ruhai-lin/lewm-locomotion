@@ -14,16 +14,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import multiprocessing as mp
 import os
 import shutil
 import sys
-import time
-from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
-from queue import Empty
-from typing import Iterable, List, Tuple
+from typing import Iterable, Tuple
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -39,7 +35,7 @@ import torch.nn.functional as F
 from dm_control import suite
 from tqdm import tqdm
 
-from src import lewm
+from src import datasets, lewm
 from src.manifold import LatentManifold, ManifoldConfig, SuccessSegment, build_latent_manifold
 from src.planner import LatentCEMPlanner, PlannerConfig, PlannerWeights
 
@@ -59,7 +55,7 @@ CKPT_DIR = OUT_DIR / "ckpt"
 TRAIN_LOG_PATH = OUT_DIR / "train_log.jsonl"
 EVAL_TRACE_PATH = OUT_DIR / "eval_trace.jsonl"
 DIAGNOSTICS_PATH = OUT_DIR / "diagnostics.json"
-DATASET_VERSION = 5
+DATASET_VERSION = 7  # bumped: 128 explore + 1 oracle goal demo (E7)
 
 
 # ---------------------------------------------------------------------------
@@ -74,22 +70,21 @@ VIDEO_WIDTH = 640
 VIDEO_HEIGHT = 480
 VIDEO_FPS = 40
 
-CLEAN_DEMO_EPISODES = 4
-PERTURBED_DEMO_EPISODES = 2
+# Exploration dataset. All explore episodes come from generic seed-driven
+# policies in ``src.datasets``; no task-specific actions, no recovery
+# scripts. The dataset is N explore + 1 oracle-CEM goal demo (the "+1"):
+# E6 showed that fully-oracle-free random policies essentially never
+# produce a frame **visually compatible with the env reset pose**, so the
+# goal manifold and the reset pose end up as disjoint islands in latent
+# space and CEM cannot bridge them. The 1 oracle demo gives the planner
+# exactly one "start-at-reset-then-walk" trajectory, making the manifold
+# reachable from where eval lives. See experiments.md E7.
+DATASET_N_EPISODES = 128
 DATASET_EPISODE_STEPS = 400
 DATASET_WORKERS = min(8, os.cpu_count() or 1)
 DATASET_MP_START_METHOD = "forkserver"
-MAX_ATTEMPTS_PER_SUCCESS = 6
-CLEAN_MIN_RETURN = 250.0
-CLEAN_MIN_MEAN_HEIGHT = 1.0
-QUALITY_TAIL_STEPS = 80
-TAIL_MIN_REWARD = 0.85
-TAIL_MIN_HEIGHT = 1.05
-TAIL_MIN_UPRIGHT = 0.85
-TAIL_MIN_VELOCITY = 0.5
-RECOVERY_MAX_MIN_HEIGHT = 0.9
-RECOVERY_MAX_MIN_UPRIGHT = 0.5
 
+# Minimal oracle-CEM (used only for the 1 goal demo, never for explore data).
 ORACLE_PLAN_HORIZON = 20
 ORACLE_CEM_SAMPLES = 128
 ORACLE_CEM_TOPK = 16
@@ -98,59 +93,32 @@ ORACLE_CEM_INIT_STD = 0.55
 ORACLE_CEM_MIN_STD = 0.06
 ORACLE_CEM_MOMENTUM = 0.15
 ORACLE_REWARD_GAMMA = 0.98
+ORACLE_TARGET_SPEED = 1.2
+ORACLE_PROGRESS_BONUS = 0.75
+ORACLE_SPEED_TRACKING_BONUS = 0.12
+ORACLE_OVERSPEED_PENALTY = 0.35
+ORACLE_POSTURE_PENALTY = 1.2
+ORACLE_ACTION_PENALTY = 0.01
+ORACLE_ACTION_SMOOTHNESS_PENALTY = 0.015
 
-TARGET_SPEED = 1.2
-PROGRESS_BONUS = 0.75
-SPEED_TRACKING_BONUS = 0.12
-OVERSPEED_PENALTY = 0.35
-POSTURE_PENALTY = 1.2
-ACTION_PENALTY = 0.01
-ACTION_SMOOTHNESS_PENALTY = 0.015
+# Goal-frame selection (applied *after* collection). Frames that pass these
+# thresholds are treated as on-manifold "walking-like" examples. Random
+# policies rarely sustain *all four* tight thresholds simultaneously for
+# many consecutive frames, so the defaults emphasise structural posture
+# (height + upright) and ask for "non-stationary forward motion" via
+# velocity. Reward is intentionally lax: it is a derived metric that adds
+# little once height/upright/velocity already pass. If post-collection
+# goal_manifold_log.json is empty, loosen these (or raise N_EPISODES).
+GOAL_FRAME_MIN_REWARD = 0.0
+GOAL_FRAME_MIN_HEIGHT = 0.9
+GOAL_FRAME_MIN_UPRIGHT = 0.5
+GOAL_FRAME_MIN_VELOCITY = 0.1
+GOAL_MIN_SEGMENT_LEN = 4
 
-PERTURB_SCHEDULE: list[tuple[int, int, float]] = [
-    (50, 12, 0.15),
-    (130, 12, 0.25),
-    (220, 14, 0.35),
-    (310, 14, 0.50),
-]
-OU_RHO = float(np.exp(-0.025 / 0.15))
-
-RECOVERY_STEPS = 260
-RECOVERY_REPEATS = 2
-RECOVERY_POSES: list[dict[str, float | str]] = [
-    {
-        "name": "forward_prone",
-        "rootz": -0.72,
-        "rooty": 1.55,
-        "qvel_rootx": 7.5,
-        "qvel_rootz": -2.0,
-        "qvel_rooty": 8.0,
-    },
-    {
-        "name": "backward_supine",
-        "rootz": -0.72,
-        "rooty": -1.55,
-        "qvel_rootx": -7.5,
-        "qvel_rootz": -2.0,
-        "qvel_rooty": -8.0,
-    },
-    {
-        "name": "upward_flip",
-        "rootz": -0.35,
-        "rooty": 3.0,
-        "qvel_rootx": 2.0,
-        "qvel_rootz": 7.0,
-        "qvel_rooty": 10.0,
-    },
-    {
-        "name": "downward_crumple",
-        "rootz": -0.92,
-        "rooty": 2.65,
-        "qvel_rootx": -2.0,
-        "qvel_rootz": -8.0,
-        "qvel_rooty": -10.0,
-    },
-]
+# Support (off-manifold) frame selection — frames that look like a fall.
+# Used as repulsion targets in the planner if W_SUPPORT_* > 0.
+SUPPORT_FRAME_MAX_HEIGHT = 0.7
+SUPPORT_FRAME_MAX_UPRIGHT = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -170,12 +138,18 @@ PREDICTOR_HEADS = 16
 PREDICTOR_DIM_HEAD = 64
 PREDICTOR_MLP_DIM = 2048
 PREDICTOR_DROPOUT = 0.1
+# "adaln_zero" matches upstream LeWM but produces zero action conditioning
+# at init, which lets the predictor collapse onto visual continuity and
+# ignore actions. "adaln_id" keeps the LeWM loss form unchanged but starts
+# with non-zero action conditioning. See experiments.md E4d for the
+# diagnostic that justifies this default.
+PREDICTOR_CONDITIONING = "adaln_id"
 
 SIGREG_WEIGHT = 0.07
 SIGREG_KNOTS = 17
 SIGREG_NUM_PROJ = 1024
 TRAIN_BATCH_SIZE = 64
-TRAIN_STEPS = 9000
+TRAIN_STEPS = 9000  # \"adaln_id\" + LeWM-pure loss needs more steps than E4a (see experiments.md E4d-v2).
 TRAIN_NUM_WORKERS = 0
 LR = 5e-5
 WEIGHT_DECAY = 1e-3
@@ -183,6 +157,20 @@ GRAD_CLIP = 1.0
 LOG_EVERY = 50
 TRAIN_ROLLOUT_STEPS = 16
 ROLLOUT_LOSS_WEIGHT = 1.0
+# Action-contrast loss was useful only as an instrumented experiment in E4a
+# to *prove* the action-bottleneck hypothesis. As a deliverable it
+# (a) breaks the LeWM-pure loss form and (b) destabilises training
+# (latent norm explodes -> rollout_loss spikes -> pred_loss spikes).
+# E4d showed that the architectural fix (PREDICTOR_CONDITIONING="adaln_id")
+# achieves the same goal with the original LeWM loss, so we keep contrast
+# **off** by default.
+ACTION_CONTRAST_WEIGHT = 0.0
+ACTION_CONTRAST_MARGIN = 0.0
+ACTION_CONTRAST_HORIZON = 0
+# Window weighting (E6 Fix C, attempt 1) backfired: by concentrating
+# training on stable walking windows it gave the predictor a more
+# predictable visual signal and the action Jacobian regressed (E6 post-fix
+# C3 measurement). Disabled in E6 post-mortem.
 TRAIN_WINDOW_WEIGHTING = False
 
 
@@ -207,7 +195,21 @@ EVAL_CEM_MIN_STD = 0.002
 EVAL_CEM_MOMENTUM = 0.15
 CEM_WARM_START_BLEND = 0.0
 CEM_PRIOR_TIE_REL = 0.0
-CEM_PRIOR_TIE_ABS = 0.05
+CEM_PRIOR_TIE_ABS = 0.0  # E7: guard fully off; CEM elite wins on cost alone.
+# Planner uses the prior block as both the CEM mean and a hard-injected
+# candidate (slot 0). Setting these to False disables both, forcing the
+# prior to compete on cost. See experiments.md E5.
+CEM_PRIOR_IN_MEAN = True
+CEM_PRIOR_IN_SAMPLES = True
+# Saturating clip on the normalised state cost. With a tight goal manifold
+# (small state_scale), being many manifold-radii away from goal makes the
+# raw state cost dominate and removes useful gradient. The clip caps state
+# cost at ~5 manifold-radii so delta/near/smooth still shape behaviour
+# outside the manifold. See experiments.md E6 follow-up.
+CEM_STATE_COST_CLIP = 0.0  # off; only useful if goal manifold is far from reset attractor.
+CEM_DELTA_COST_CLIP = 0.0
+CEM_NEAR_COST_CLIP = 0.0
+W_NEAR = 0.01  # original value, restored.
 RECOVERY_DISTANCE_CENTER = 0.20
 RECOVERY_DISTANCE_TEMPERATURE = 0.07
 RECOVERY_PRESSURE_POWER = 1.4
@@ -224,7 +226,8 @@ W_STATE = 0.2
 W_DELTA = 4.0
 W_SUPPORT_STATE = 0.0
 W_SUPPORT_DELTA = 0.0
-W_NEAR = 0.01
+# W_NEAR is defined above (bumped to 0.1 in E6 follow-up); keeping the
+# variable here only for documentation cohesion.
 W_ACTION_PRIOR = 0.1
 W_SMOOTH = 0.1
 W_FAR_SMOOTH = 0.015
@@ -341,23 +344,186 @@ def discounted_sum(rewards: Iterable[float], gamma: float) -> float:
     return float(total)
 
 
-def perturb_sigma(step: int) -> float:
-    for start, length, sigma in PERTURB_SCHEDULE:
-        if start <= step < start + length:
-            return sigma
-    return 0.0
+# ---------------------------------------------------------------------------
+# Oracle-free dataset collection.  All episodes come from generic
+# exploration policies defined in src.datasets. The only thing this adapter
+# contributes is task wiring: how to make the env, how to render a frame,
+# what per-step metrics to record, and how to label frames after the fact.
+# ---------------------------------------------------------------------------
 
 
-def burst_starts(step: int) -> bool:
-    return any(step == start for start, _, _ in PERTURB_SCHEDULE)
+def _env_fn(seed: int):
+    return make_env(seed)
 
 
-def emit_progress(progress_queue, progress_id: int | None, postfix: dict) -> None:
-    if progress_queue is not None and progress_id is not None:
-        progress_queue.put((int(progress_id), 1, postfix))
+def _render_fn(env) -> np.ndarray:
+    return render_dataset_frame(env)
 
 
-def score_oracle_candidate(
+def _action_bounds_fn(env) -> tuple[np.ndarray, np.ndarray]:
+    return action_bounds(env)
+
+
+def _record_fn(env) -> dict[str, float]:
+    return diagnostics(env)
+
+
+# Register with src.datasets so worker processes (forkserver) can resolve
+# these functions by re-importing this module — no closure pickling.
+datasets.register_task(
+    "walker_walk",
+    datasets.TaskHandles(
+        env_fn=_env_fn,
+        render_fn=_render_fn,
+        action_bounds_fn=_action_bounds_fn,
+        record_fn=_record_fn,
+        dt=0.025,  # dm_control walker step length (40 Hz).
+    ),
+)
+
+
+def goal_frame_mask(ep: dict[str, np.ndarray]) -> np.ndarray:
+    """Per-frame boolean mask of "this frame looks like stable walking".
+
+    Operates only on per-step metrics; lives in the task adapter because
+    "what counts as walking" is task knowledge. The src/ layer never sees
+    these thresholds.
+    """
+    num_frames = len(ep["pixels"])
+    if num_frames == 0:
+        return np.zeros(0, dtype=bool)
+    action_steps = max(num_frames - 1, 1)
+    frame_ids = np.arange(num_frames)
+    metric_ids = np.clip(frame_ids - 1, 0, action_steps - 1)
+    mask = np.ones(num_frames, dtype=bool)
+    for key, threshold in (
+        ("rewards", GOAL_FRAME_MIN_REWARD),
+        ("torso_height", GOAL_FRAME_MIN_HEIGHT),
+        ("torso_upright", GOAL_FRAME_MIN_UPRIGHT),
+        ("horizontal_velocity", GOAL_FRAME_MIN_VELOCITY),
+    ):
+        if key in ep:
+            values = np.asarray(ep[key])
+            ids = np.clip(metric_ids, 0, len(values) - 1)
+            mask = mask & (values[ids] >= threshold)
+    return mask
+
+
+def fall_frame_mask(ep: dict[str, np.ndarray]) -> np.ndarray:
+    """Per-frame boolean mask of "this frame looks like a fall"."""
+    num_frames = len(ep["pixels"])
+    if num_frames == 0:
+        return np.zeros(0, dtype=bool)
+    action_steps = max(num_frames - 1, 1)
+    frame_ids = np.arange(num_frames)
+    metric_ids = np.clip(frame_ids - 1, 0, action_steps - 1)
+    out = np.zeros(num_frames, dtype=bool)
+    if "torso_height" in ep:
+        h = np.asarray(ep["torso_height"])
+        out = out | (h[np.clip(metric_ids, 0, len(h) - 1)] <= SUPPORT_FRAME_MAX_HEIGHT)
+    if "torso_upright" in ep:
+        u = np.asarray(ep["torso_upright"])
+        out = out | (u[np.clip(metric_ids, 0, len(u) - 1)] <= SUPPORT_FRAME_MAX_UPRIGHT)
+    return out
+
+
+def _contiguous_segments(mask: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0:
+        return []
+    diff = np.diff(mask.astype(np.int8), prepend=0, append=0)
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    return [(int(s), int(e)) for s, e in zip(starts, ends) if e - s >= min_len]
+
+
+def pick_goal_trajectory_from_dataset(dataset_dir: Path) -> dict[str, np.ndarray] | None:
+    """Stitch every "looks like walking" contiguous segment across all
+    episodes into a single synthetic goal trajectory, ordered longest-first.
+
+    Returns ``None`` if no segment passes ``goal_frame_mask`` for
+    ``GOAL_MIN_SEGMENT_LEN`` consecutive frames. The first segment becomes
+    the prefix used by the eval bootstrap; later segments give the prior a
+    longer "rhythm" to cycle through. All concatenated actions still
+    satisfy ``actions[t]`` advances ``pixels[t]`` to ``pixels[t+1]`` *within
+    a segment*; segment boundaries are visual discontinuities, which the
+    eval handles via its phase-wrapping logic.
+    """
+    candidates: list[tuple[int, Path, int, int]] = []  # (length, path, start, end)
+    for path in sorted(dataset_dir.glob("episode_*.npz")):
+        with np.load(path) as ep_npz:
+            ep = {k: ep_npz[k] for k in ep_npz.files}
+        mask = goal_frame_mask(ep)
+        for s, e in _contiguous_segments(mask, GOAL_MIN_SEGMENT_LEN):
+            candidates.append((e - s, path, s, e))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: -c[0])  # longest first
+
+    pix_parts: list[np.ndarray] = []
+    act_parts: list[np.ndarray] = []
+    rew_parts: list[np.ndarray] = []
+    metric_parts: dict[str, list[np.ndarray]] = {}
+    sources: list[dict] = []
+    for length, path, s, e in candidates:
+        with np.load(path) as ep_npz:
+            ep = {k: ep_npz[k] for k in ep_npz.files}
+        # Take pixels [s, e) and actions [s, e-1) so the segment is
+        # internally consistent.
+        if e - s < 2:
+            continue
+        pix_parts.append(ep["pixels"][s:e].copy())
+        act_parts.append(ep["actions"][s : e - 1].copy())
+        if "rewards" in ep:
+            rew_parts.append(ep["rewards"][s : e - 1].copy())
+        for key in ("torso_height", "torso_upright", "horizontal_velocity", "torso_x"):
+            if key in ep:
+                metric_parts.setdefault(key, []).append(np.asarray(ep[key])[s : e - 1].copy())
+        sources.append({
+            "episode": path.name,
+            "segment_start": int(s),
+            "segment_end": int(e),
+            "segment_len": int(length),
+        })
+    if not pix_parts:
+        return None
+    sliced = {
+        "pixels": np.concatenate(pix_parts, axis=0),
+        "actions": np.concatenate(act_parts, axis=0),
+    }
+    if rew_parts:
+        sliced["rewards"] = np.concatenate(rew_parts, axis=0)
+    for key, parts in metric_parts.items():
+        sliced[key] = np.concatenate(parts, axis=0)
+    sliced["metadata"] = np.asarray(
+        json.dumps(
+            {
+                "source_episodes": sources,
+                "n_segments": len(sources),
+                "total_pixels": int(sliced["pixels"].shape[0]),
+                "total_actions": int(sliced["actions"].shape[0]),
+                "action_semantics": "actions[t] advances pixels[t] to pixels[t+1] within a segment",
+            }
+        )
+    )
+    return sliced
+
+
+# ---------------------------------------------------------------------------
+# Oracle-CEM goal demo (the "+1" of "128 + 1").
+#
+# This runs an oracle simulator-state-restoring CEM with a hand-coded reward
+# (forward speed + posture) to produce **one** clean walking trajectory that
+# starts from the env reset pose. The 128 explore episodes are still
+# oracle-free; this single trajectory only seeds the goal manifold with a
+# reachable-from-reset path. Used in the planner exclusively as the
+# ``goal_trajectory`` for the prior + near terms (it is not added to the
+# wider goal_frame_mask sweep across explore episodes; if you want the
+# manifold larger, raise N_EPISODES instead of adding more oracle data).
+# ---------------------------------------------------------------------------
+
+
+def _score_oracle_candidate(
     oracle_env,
     state0: np.ndarray,
     actions: np.ndarray,
@@ -367,14 +533,12 @@ def score_oracle_candidate(
     oracle_env.physics.set_state(state0)
     oracle_env.physics.forward()
     start_x = float(oracle_env.physics.named.data.xpos["torso", "x"])
-
-    rewards: List[float] = []
+    rewards: list[float] = []
     last_action = previous_action
     smooth_cost = 0.0
     speed_tracking = 0.0
     overspeed_cost = 0.0
     posture_cost = 0.0
-
     for action in actions:
         ts = oracle_env.step(action.astype(np.float32))
         velocity = float(oracle_env.physics.horizontal_velocity())
@@ -382,28 +546,27 @@ def score_oracle_candidate(
         upright = float(oracle_env.physics.torso_upright())
         rewards.append(float(ts.reward or 0.0))
         smooth_cost += float(np.mean((action - last_action) ** 2))
-        speed_tracking += float(np.exp(-((velocity - TARGET_SPEED) ** 2) / 0.5))
+        speed_tracking += float(np.exp(-((velocity - ORACLE_TARGET_SPEED) ** 2) / 0.5))
         overspeed_cost += max(velocity - 1.8, 0.0) ** 2
         posture_cost += max(1.0 - height, 0.0) ** 2 + max(0.75 - upright, 0.0) ** 2
         last_action = action
         if ts.last():
             break
-
     final_x = float(oracle_env.physics.named.data.xpos["torso", "x"])
     progress = max(final_x - start_x, 0.0)
     n = max(len(rewards), 1)
     return (
         discounted_sum(rewards, ORACLE_REWARD_GAMMA)
-        + PROGRESS_BONUS * progress
-        + SPEED_TRACKING_BONUS * (speed_tracking / n)
-        - OVERSPEED_PENALTY * (overspeed_cost / n)
-        - POSTURE_PENALTY * (posture_cost / n)
-        - ACTION_PENALTY * float(np.mean(actions**2))
-        - ACTION_SMOOTHNESS_PENALTY * smooth_cost
+        + ORACLE_PROGRESS_BONUS * progress
+        + ORACLE_SPEED_TRACKING_BONUS * (speed_tracking / n)
+        - ORACLE_OVERSPEED_PENALTY * (overspeed_cost / n)
+        - ORACLE_POSTURE_PENALTY * (posture_cost / n)
+        - ORACLE_ACTION_PENALTY * float(np.mean(actions**2))
+        - ORACLE_ACTION_SMOOTHNESS_PENALTY * smooth_cost
     )
 
 
-def oracle_cem_plan(
+def _oracle_cem_plan(
     oracle_env,
     state0: np.ndarray,
     low: np.ndarray,
@@ -416,10 +579,8 @@ def oracle_cem_plan(
     mean = init_mean.astype(np.float32).copy()
     std = np.full_like(mean, ORACLE_CEM_INIT_STD, dtype=np.float32)
     topk = min(ORACLE_CEM_TOPK, ORACLE_CEM_SAMPLES)
-
     best_plan: np.ndarray | None = None
     best_score = -float("inf")
-
     for _ in range(ORACLE_CEM_ITERS):
         samples = rng.normal(
             loc=mean[None],
@@ -428,232 +589,62 @@ def oracle_cem_plan(
         ).astype(np.float32)
         samples[0] = mean
         samples = np.clip(samples, low.reshape(1, 1, -1), high.reshape(1, 1, -1))
-
         scores = np.empty(samples.shape[0], dtype=np.float32)
         for i in range(samples.shape[0]):
-            scores[i] = score_oracle_candidate(
-                oracle_env, state0, samples[i], previous_action
-            )
-
+            scores[i] = _score_oracle_candidate(oracle_env, state0, samples[i], previous_action)
         elite_idx = np.argpartition(-scores, topk - 1)[:topk]
         elites = samples[elite_idx]
         elite_mean = elites.mean(axis=0).astype(np.float32)
         elite_std = np.maximum(elites.std(axis=0), ORACLE_CEM_MIN_STD).astype(np.float32)
         mean = (1.0 - ORACLE_CEM_MOMENTUM) * elite_mean + ORACLE_CEM_MOMENTUM * mean
         std = elite_std
-
         i_best = int(np.argmax(scores))
         if float(scores[i_best]) > best_score:
             best_score = float(scores[i_best])
             best_plan = samples[i_best].copy()
-
     assert best_plan is not None
     return best_plan[0].astype(np.float32), mean.astype(np.float32), best_score
 
 
-def collect_oracle_episode(
-    seed: int,
-    noisy: bool,
-    desc: str,
-    progress: bool = True,
-    progress_queue=None,
-    progress_id: int | None = None,
-) -> dict:
+def collect_oracle_goal_demo(seed: int = SEED) -> dict[str, np.ndarray]:
+    """Run an oracle-CEM-controlled walker for one full episode."""
     rng = np.random.default_rng(seed)
     env = make_env(seed)
     oracle_env = make_env(seed + 10_000)
     low, high = action_bounds(env)
     action_dim = int(low.shape[0])
     env.reset()
-
     plan_mean = np.zeros((ORACLE_PLAN_HORIZON, action_dim), dtype=np.float32)
     previous_action = np.zeros(action_dim, dtype=np.float32)
-    eta = np.zeros(action_dim, dtype=np.float32)
-    ou_scale = float(np.sqrt(1.0 - OU_RHO * OU_RHO))
 
-    pixels: List[np.ndarray] = [render_dataset_frame(env)]
-    actions: List[np.ndarray] = []
-    oracle_actions: List[np.ndarray] = []
-    rewards: List[float] = []
-    heights: List[float] = []
-    uprights: List[float] = []
-    velocities: List[float] = []
-    torso_x: List[float] = []
-    sigmas: List[float] = []
-    planner_scores: List[float] = []
+    pixels = [render_dataset_frame(env)]
+    actions: list[np.ndarray] = []
+    rewards: list[float] = []
+    heights: list[float] = []
+    uprights: list[float] = []
+    velocities: list[float] = []
+    torso_x: list[float] = []
 
-    bar = tqdm(
-        range(DATASET_EPISODE_STEPS),
-        desc=desc,
-        dynamic_ncols=True,
-        leave=False,
-        disable=not progress,
-    )
-    for step in bar:
+    bar = tqdm(range(DATASET_EPISODE_STEPS), desc="oracle goal", dynamic_ncols=True)
+    for _step in bar:
         state0 = env.physics.get_state().copy()
-        oracle_action, plan_mean, score = oracle_cem_plan(
+        action, plan_mean, _score = _oracle_cem_plan(
             oracle_env, state0, low, high, plan_mean, previous_action, rng
         )
         plan_mean = np.concatenate(
             [plan_mean[1:], np.zeros((1, action_dim), dtype=np.float32)],
             axis=0,
         )
-
-        sigma = perturb_sigma(step) if noisy else 0.0
-        if burst_starts(step):
-            eta[:] = 0.0
-        if sigma > 0.0:
-            eta = OU_RHO * eta + ou_scale * rng.standard_normal(action_dim).astype(np.float32)
-            action = np.clip(oracle_action + sigma * eta, low, high).astype(np.float32)
-        else:
-            eta[:] = 0.0
-            action = oracle_action
-
         ts = env.step(action)
         diag = diagnostics(env)
         pixels.append(render_dataset_frame(env))
         actions.append(action.copy())
-        oracle_actions.append(oracle_action.copy())
         rewards.append(float(ts.reward or 0.0))
         heights.append(diag["torso_height"])
         uprights.append(diag["torso_upright"])
         velocities.append(diag["horizontal_velocity"])
         torso_x.append(diag["torso_x"])
-        sigmas.append(sigma)
-        planner_scores.append(float(score))
         previous_action = action
-
-        bar.set_postfix(
-            {
-                "ret": f"{sum(rewards):.1f}",
-                "v": f"{diag['horizontal_velocity']:.2f}",
-                "h": f"{diag['torso_height']:.2f}",
-                "up": f"{diag['torso_upright']:.2f}",
-                "sig": f"{sigma:.2f}",
-            }
-        )
-        emit_progress(
-            progress_queue,
-            progress_id,
-            {
-                "ret": f"{sum(rewards):.1f}",
-                "v": f"{diag['horizontal_velocity']:.2f}",
-                "h": f"{diag['torso_height']:.2f}",
-                "up": f"{diag['torso_upright']:.2f}",
-                "sig": f"{sigma:.2f}",
-            },
-        )
-        if ts.last():
-            break
-
-    bar.close()
-    env.close()
-    oracle_env.close()
-
-    metadata = {
-        "domain": DOMAIN,
-        "task": TASK,
-        "seed": seed,
-        "noisy": noisy,
-        "perturb_schedule": [
-            {"start": s, "length": length, "sigma": sigma}
-            for s, length, sigma in PERTURB_SCHEDULE
-        ],
-        "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
-    }
-    return {
-        "pixels": np.stack(pixels, axis=0).astype(np.uint8),
-        "actions": np.stack(actions, axis=0).astype(np.float32),
-        "oracle_actions": np.stack(oracle_actions, axis=0).astype(np.float32),
-        "rewards": np.asarray(rewards, dtype=np.float32),
-        "torso_height": np.asarray(heights, dtype=np.float32),
-        "torso_upright": np.asarray(uprights, dtype=np.float32),
-        "horizontal_velocity": np.asarray(velocities, dtype=np.float32),
-        "torso_x": np.asarray(torso_x, dtype=np.float32),
-        "sigmas": np.asarray(sigmas, dtype=np.float32),
-        "planner_scores": np.asarray(planner_scores, dtype=np.float32),
-        "metadata": json.dumps(metadata),
-    }
-
-
-def apply_recovery_pose(env, scenario: dict[str, float | str], rng: np.random.Generator) -> None:
-    """Place walker in a hard off-manifold pose before oracle recovery."""
-    env.physics.named.data.qpos["rootz"] = float(scenario["rootz"])
-    env.physics.named.data.qpos["rooty"] = float(scenario["rooty"])
-    env.physics.named.data.qvel["rootx"] = float(scenario["qvel_rootx"])
-    env.physics.named.data.qvel["rootz"] = float(scenario["qvel_rootz"])
-    env.physics.named.data.qvel["rooty"] = float(scenario["qvel_rooty"])
-    for name in [
-        "right_hip",
-        "right_knee",
-        "right_ankle",
-        "left_hip",
-        "left_knee",
-        "left_ankle",
-    ]:
-        env.physics.named.data.qpos[name] += float(rng.normal(0.0, 0.08))
-        env.physics.named.data.qvel[name] = float(rng.normal(0.0, 1.0))
-    env.physics.forward()
-
-
-def collect_recovery_episode(
-    seed: int,
-    scenario: dict[str, float | str],
-    desc: str,
-    progress: bool = True,
-    progress_queue=None,
-    progress_id: int | None = None,
-) -> dict:
-    rng = np.random.default_rng(seed)
-    env = make_env(seed)
-    oracle_env = make_env(seed + 10_000)
-    low, high = action_bounds(env)
-    action_dim = int(low.shape[0])
-    env.reset()
-    apply_recovery_pose(env, scenario, rng)
-
-    plan_mean = np.zeros((ORACLE_PLAN_HORIZON, action_dim), dtype=np.float32)
-    previous_action = np.zeros(action_dim, dtype=np.float32)
-    pixels: List[np.ndarray] = [render_dataset_frame(env)]
-    actions: List[np.ndarray] = []
-    oracle_actions: List[np.ndarray] = []
-    rewards: List[float] = []
-    heights: List[float] = []
-    uprights: List[float] = []
-    velocities: List[float] = []
-    torso_x: List[float] = []
-    sigmas: List[float] = []
-    planner_scores: List[float] = []
-
-    bar = tqdm(
-        range(RECOVERY_STEPS),
-        desc=desc,
-        dynamic_ncols=True,
-        leave=False,
-        disable=not progress,
-    )
-    for _ in bar:
-        state0 = env.physics.get_state().copy()
-        oracle_action, plan_mean, score = oracle_cem_plan(
-            oracle_env, state0, low, high, plan_mean, previous_action, rng
-        )
-        plan_mean = np.concatenate(
-            [plan_mean[1:], np.zeros((1, action_dim), dtype=np.float32)],
-            axis=0,
-        )
-        ts = env.step(oracle_action)
-        diag = diagnostics(env)
-        pixels.append(render_dataset_frame(env))
-        actions.append(oracle_action.copy())
-        oracle_actions.append(oracle_action.copy())
-        rewards.append(float(ts.reward or 0.0))
-        heights.append(diag["torso_height"])
-        uprights.append(diag["torso_upright"])
-        velocities.append(diag["horizontal_velocity"])
-        torso_x.append(diag["torso_x"])
-        sigmas.append(0.0)
-        planner_scores.append(float(score))
-        previous_action = oracle_action
         bar.set_postfix(
             {
                 "ret": f"{sum(rewards):.1f}",
@@ -662,46 +653,35 @@ def collect_recovery_episode(
                 "up": f"{diag['torso_upright']:.2f}",
             }
         )
-        emit_progress(
-            progress_queue,
-            progress_id,
-            {
-                "ret": f"{sum(rewards):.1f}",
-                "v": f"{diag['horizontal_velocity']:.2f}",
-                "h": f"{diag['torso_height']:.2f}",
-                "up": f"{diag['torso_upright']:.2f}",
-            },
-        )
         if ts.last():
             break
-
     bar.close()
     env.close()
     oracle_env.close()
-    metadata = {
-        "domain": DOMAIN,
-        "task": TASK,
-        "seed": seed,
-        "kind": "scripted_recovery",
-        "scenario": scenario,
-        "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
-    }
     return {
         "pixels": np.stack(pixels, axis=0).astype(np.uint8),
         "actions": np.stack(actions, axis=0).astype(np.float32),
-        "oracle_actions": np.stack(oracle_actions, axis=0).astype(np.float32),
         "rewards": np.asarray(rewards, dtype=np.float32),
         "torso_height": np.asarray(heights, dtype=np.float32),
         "torso_upright": np.asarray(uprights, dtype=np.float32),
         "horizontal_velocity": np.asarray(velocities, dtype=np.float32),
         "torso_x": np.asarray(torso_x, dtype=np.float32),
-        "sigmas": np.asarray(sigmas, dtype=np.float32),
-        "planner_scores": np.asarray(planner_scores, dtype=np.float32),
-        "metadata": json.dumps(metadata),
+        "metadata": np.asarray(
+            json.dumps(
+                {
+                    "kind": "oracle_goal_demo",
+                    "domain": DOMAIN,
+                    "task": TASK,
+                    "seed": seed,
+                    "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
+                }
+            )
+        ),
     }
 
 
 def dataset_ready() -> bool:
+    """Return True iff the on-disk dataset matches DATASET_VERSION."""
     if not (
         DATASET_DIR.exists()
         and (DATASET_DIR / "goal_trajectory.npz").exists()
@@ -718,418 +698,114 @@ def dataset_ready() -> bool:
     return int(metadata.get("dataset_version", -1)) == DATASET_VERSION
 
 
-def save_episode(path: Path, episode: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, **episode)
-
-
-def dataset_targets() -> dict[str, int]:
-    targets = {
-        "clean": CLEAN_DEMO_EPISODES,
-        "perturbed": PERTURBED_DEMO_EPISODES,
-    }
-    for scenario in RECOVERY_POSES:
-        targets[f"recovery/{scenario['name']}"] = RECOVERY_REPEATS
-    return targets
-
-
-def make_attempt_job(kind: str, attempt: int, idx: int, have: int, target: int) -> dict:
-    desc = f"try{idx:03d} {kind} {have + 1}/{target}"
-    job = {
-        "idx": idx,
-        "kind": kind,
-        "bar_desc": desc,
-        "desc": desc,
-    }
-    if kind == "clean":
-        job.update(
-            {
-                "collector": "oracle",
-                "seed": SEED + attempt,
-                "noisy": False,
-            }
-        )
-        return job
-    if kind == "perturbed":
-        job.update(
-            {
-                "collector": "oracle",
-                "seed": SEED + 1_000 + attempt,
-                "noisy": True,
-            }
-        )
-        return job
-
-    scenario_name = kind.split("/", 1)[1]
-    for scenario_idx, scenario in enumerate(RECOVERY_POSES):
-        if scenario["name"] == scenario_name:
-            job.update(
-                {
-                    "collector": "recovery",
-                    "seed": SEED + 2_000 + scenario_idx * 10_000 + attempt,
-                    "scenario": dict(scenario),
-                }
-            )
-            return job
-    raise ValueError(f"unknown dataset kind: {kind}")
-
-
-def collect_episode_job(job: dict) -> tuple[int, str, dict]:
-    progress = bool(job.get("progress", False))
-    progress_queue = job.get("progress_queue")
-    progress_id = int(job["idx"]) if progress_queue is not None else None
-    if job["collector"] == "oracle":
-        episode = collect_oracle_episode(
-            seed=int(job["seed"]),
-            noisy=bool(job["noisy"]),
-            desc=str(job["desc"]),
-            progress=progress,
-            progress_queue=progress_queue,
-            progress_id=progress_id,
-        )
-    elif job["collector"] == "recovery":
-        episode = collect_recovery_episode(
-            seed=int(job["seed"]),
-            scenario=job["scenario"],
-            desc=str(job["desc"]),
-            progress=progress,
-            progress_queue=progress_queue,
-            progress_id=progress_id,
-        )
-    else:
-        raise ValueError(f"unknown dataset collector: {job['collector']}")
-    return int(job["idx"]), str(job["kind"]), episode
-
-
-def collect_dataset_episodes_sequential(
-    jobs: list[dict],
-    save_dir: Path,
-) -> list[tuple[Path, str]]:
-    saved: list[tuple[Path, str]] = []
-    for job in jobs:
-        idx, kind, ep = collect_episode_job({**job, "progress": True})
-        path = save_dir / f"candidate_{idx:04d}.npz"
-        save_episode(path, ep)
-        saved.append((path, kind))
-    return saved
-
-
-def remove_partial_episodes(save_dir: Path) -> None:
-    for path in save_dir.glob("candidate_*.npz"):
-        path.unlink()
-
-
-def job_total(job: dict) -> int:
-    return RECOVERY_STEPS if job["collector"] == "recovery" else DATASET_EPISODE_STEPS
-
-
-def job_bar_desc(job: dict) -> str:
-    return str(job.get("bar_desc", f"try{int(job['idx']):03d} {job['kind']}"))
-
-
-def collect_dataset_episodes(
-    jobs: list[dict],
-    save_dir: Path,
-) -> list[tuple[Path, str]]:
-    workers = max(1, min(DATASET_WORKERS, len(jobs)))
-    save_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[data] collecting {len(jobs)} candidate episodes with workers={workers}")
-
-    if workers == 1:
-        return collect_dataset_episodes_sequential(jobs, save_dir)
-
-    try:
-        ctx = mp.get_context(DATASET_MP_START_METHOD)
-        saved: list[tuple[Path, str]] = []
-        futures = {}
-        with ctx.Manager() as manager:
-            progress_queue = manager.Queue()
-            bars = {
-                int(job["idx"]): tqdm(
-                    total=job_total(job),
-                    desc=job_bar_desc(job),
-                    position=pos,
-                    leave=True,
-                    dynamic_ncols=True,
-                )
-                for pos, job in enumerate(jobs)
-            }
-            try:
-                with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-                    for job in jobs:
-                        futures[
-                            pool.submit(
-                                collect_episode_job,
-                                {**job, "progress_queue": progress_queue},
-                            )
-                        ] = job
-                    pending = set(futures)
-                    while pending:
-                        while True:
-                            try:
-                                progress_id, n_steps, postfix = progress_queue.get_nowait()
-                            except Empty:
-                                break
-                            bar = bars.get(int(progress_id))
-                            if bar is not None:
-                                step_inc = min(
-                                    int(n_steps),
-                                    max(int(bar.total or 0) - int(bar.n), 0),
-                                )
-                                if step_inc > 0:
-                                    bar.update(step_inc)
-                                if postfix:
-                                    bar.set_postfix(postfix)
-
-                        done = [fut for fut in pending if fut.done()]
-                        if not done:
-                            time.sleep(0.05)
-                            continue
-                        for fut in done:
-                            pending.remove(fut)
-                            idx, kind, ep = fut.result()
-                            path = save_dir / f"candidate_{idx:04d}.npz"
-                            save_episode(path, ep)
-                            saved.append((path, kind))
-                            bar = bars.get(idx)
-                            if bar is not None and bar.n < bar.total:
-                                bar.update(bar.total - bar.n)
-                        for bar in bars.values():
-                            bar.refresh()
-
-                while True:
-                    try:
-                        progress_id, n_steps, postfix = progress_queue.get_nowait()
-                    except Empty:
-                        break
-                    bar = bars.get(int(progress_id))
-                    if bar is not None:
-                        step_inc = min(int(n_steps), max(int(bar.total or 0) - int(bar.n), 0))
-                        if step_inc > 0:
-                            bar.update(step_inc)
-                        if postfix:
-                            bar.set_postfix(postfix)
-            finally:
-                for bar in bars.values():
-                    bar.close()
-        return sorted(saved, key=lambda item: item[0].name)
-    except Exception as exc:
-        print(f"[data] parallel collection failed ({type(exc).__name__}: {exc})")
-        print("[data] retrying dataset collection sequentially")
-        remove_partial_episodes(save_dir)
-        return collect_dataset_episodes_sequential(jobs, save_dir)
-
-
 def build_static_dataset() -> None:
+    """Collect 128 oracle-free explore episodes + 1 oracle-CEM goal demo.
+
+    The 128 explore episodes provide LeWM with diverse pixel/action data
+    (most of which is the walker falling or thrashing). The 1 oracle demo
+    provides exactly one trajectory that starts from the env reset pose
+    and walks forward; this becomes the planner's goal trajectory and the
+    seed of the goal manifold. Post-hoc explore-frame goal selection then
+    augments the manifold with whatever walking-like moments the random
+    policies happened to produce.
+    """
     if dataset_ready():
         print(f"[data] using existing dataset -> {DATASET_DIR}")
         return
 
-    print(f"[data] creating static dataset -> {DATASET_DIR}")
+    print(f"[data] creating dataset -> {DATASET_DIR} (128 explore + 1 oracle)")
     if DATASET_DIR.exists():
         shutil.rmtree(DATASET_DIR)
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
-    kept, summaries = collect_successful_dataset()
+    collect_metadata = datasets.collect_dataset(
+        out_dir=DATASET_DIR,
+        task_name="walker_walk",
+        task_module="tasks.walker_walk",
+        config=datasets.CollectConfig(
+            n_episodes=DATASET_N_EPISODES,
+            episode_steps=DATASET_EPISODE_STEPS,
+            workers=DATASET_WORKERS,
+            seed=SEED,
+            mp_start_method=DATASET_MP_START_METHOD,
+        ),
+    )
 
-    clean_paths = [path for path, kind in kept if kind == "clean"]
-    if not clean_paths:
-        raise RuntimeError("No successful clean walking demos were collected.")
+    # The +1: run oracle-CEM for one episode and use it as the goal demo.
+    print("[data] collecting 1 oracle-CEM goal demo...")
+    oracle_demo = collect_oracle_goal_demo(seed=SEED)
+    # Save the oracle demo as a regular episode so LeWM also trains on it.
+    oracle_path = DATASET_DIR / f"episode_{DATASET_N_EPISODES:04d}.npz"
+    np.savez_compressed(oracle_path, **oracle_demo)
+    print(
+        f"[data] oracle demo: return={float(oracle_demo['rewards'].sum()):.1f}, "
+        f"mean_height={float(oracle_demo['torso_height'].mean()):.2f}, "
+        f"mean_upright={float(oracle_demo['torso_upright'].mean()):.2f}, "
+        f"mean_velocity={float(oracle_demo['horizontal_velocity'].mean()):.2f} "
+        f"-> {oracle_path.name}"
+    )
 
-    goal_path = pick_best_clean_episode(clean_paths)
-    with np.load(goal_path) as goal:
-        np.savez_compressed(
-            DATASET_DIR / "goal_trajectory.npz",
-            pixels=goal["pixels"],
-            actions=goal["actions"],
-            rewards=goal["rewards"],
-            torso_height=goal["torso_height"],
-            torso_upright=goal["torso_upright"],
-            horizontal_velocity=goal["horizontal_velocity"],
-            metadata=json.dumps(
+    # Use the oracle demo *directly* as the goal trajectory — its first
+    # frame matches the env reset pose, so eval is reachable.
+    goal_traj = {
+        "pixels": oracle_demo["pixels"],
+        "actions": oracle_demo["actions"],
+        "rewards": oracle_demo["rewards"],
+        "torso_height": oracle_demo["torso_height"],
+        "torso_upright": oracle_demo["torso_upright"],
+        "horizontal_velocity": oracle_demo["horizontal_velocity"],
+        "metadata": np.asarray(
+            json.dumps(
                 {
-                    "source_episode": goal_path.name,
+                    "source": "oracle_goal_demo",
+                    "n_segments": 1,
+                    "total_pixels": int(oracle_demo["pixels"].shape[0]),
+                    "total_actions": int(oracle_demo["actions"].shape[0]),
                     "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
                 }
-            ),
-        )
+            )
+        ),
+    }
+    np.savez_compressed(DATASET_DIR / "goal_trajectory.npz", **goal_traj)
+    goal_meta = json.loads(str(goal_traj["metadata"]))
+    print(
+        f"[data] goal_trajectory: source={goal_meta['source']} "
+        f"{goal_meta['total_pixels']} pixel frames, "
+        f"{goal_meta['total_actions']} action steps"
+    )
+
+    # Render goal_manifold.mp4 + log so a human can verify the manifold.
+    print("[data] rendering goal_manifold.mp4 from all goal frames...")
+    stats = datasets.render_goal_manifold(
+        dataset_dir=DATASET_DIR,
+        out_dir=DATASET_DIR,
+        goal_mask_fn=goal_frame_mask,
+        video_fps=VIDEO_FPS,
+        min_segment_len=GOAL_MIN_SEGMENT_LEN,
+    )
 
     write_json(
         DATASET_DIR / "metadata.json",
         {
             "dataset_version": DATASET_VERSION,
             "config": hparams(),
-            "episodes": summaries,
-            "goal_episode": goal_path.name,
+            "collect_config": collect_metadata["config"],
+            "episodes": collect_metadata["episodes"],
+            "goal_trajectory": goal_meta,
+            "goal_manifold_stats": {
+                "total_frames": stats.total_frames,
+                "total_segments": stats.total_segments,
+                "episodes_contributing": stats.episodes_contributing,
+                "metrics_summary": stats.metrics_summary,
+            },
         },
     )
-    recovery_count = sum(kind.startswith("recovery/") for _, kind in kept)
-    skipped = sum(bool(summary.get("skipped", False)) for summary in summaries)
     print(
-        f"[data] wrote {len(kept)} usable episodes "
-        f"({recovery_count} recovery, {skipped} skipped) and goal trajectory"
+        f"[data] dataset built: {len(collect_metadata['episodes'])} explore + 1 oracle, "
+        f"goal_manifold {stats.total_frames} frames across "
+        f"{stats.episodes_contributing} episodes"
     )
 
-
-def collect_successful_dataset() -> tuple[list[tuple[Path, str]], list[dict]]:
-    targets = dataset_targets()
-    successes = {kind: 0 for kind in targets}
-    attempts = {kind: 0 for kind in targets}
-    candidate_dir = DATASET_DIR / "candidates"
-    kept: list[tuple[Path, str]] = []
-    summaries: list[dict] = []
-    next_candidate_idx = 0
-    next_episode_idx = 0
-
-    while any(successes[kind] < target for kind, target in targets.items()):
-        jobs: list[dict] = []
-        for kind, target in targets.items():
-            missing = target - successes[kind]
-            if missing <= 0:
-                continue
-            max_attempts = target * MAX_ATTEMPTS_PER_SUCCESS
-            remaining_attempts = max_attempts - attempts[kind]
-            if remaining_attempts <= 0:
-                raise RuntimeError(
-                    f"Could not collect enough successful {kind} episodes: "
-                    f"{successes[kind]}/{target} succeeded after {attempts[kind]} attempts."
-                )
-            for _ in range(min(missing, remaining_attempts)):
-                jobs.append(
-                    make_attempt_job(
-                        kind=kind,
-                        attempt=attempts[kind],
-                        idx=next_candidate_idx,
-                        have=successes[kind],
-                        target=target,
-                    )
-                )
-                attempts[kind] += 1
-                next_candidate_idx += 1
-
-        for candidate_path, kind in collect_dataset_episodes(jobs, candidate_dir):
-            summary = summarize_episode(candidate_path, kind)
-            summary["attempt_file"] = candidate_path.name
-            skip_reason = episode_skip_reason(summary)
-            if skip_reason is not None:
-                summary["skipped"] = True
-                summary["skip_reason"] = skip_reason
-                candidate_path.unlink(missing_ok=True)
-                print(
-                    f"[data] skip {candidate_path.name} {kind}: {skip_reason} "
-                    f"(ret={summary['return']:.1f}, "
-                    f"tail_r={summary['tail_reward']:.2f}, "
-                    f"tail_h={summary['tail_height']:.2f}, "
-                    f"tail_up={summary['tail_upright']:.2f})"
-                )
-                summaries.append(summary)
-                continue
-
-            if successes[kind] >= targets[kind]:
-                candidate_path.unlink(missing_ok=True)
-                continue
-
-            final_path = DATASET_DIR / f"episode_{next_episode_idx:03d}.npz"
-            candidate_path.replace(final_path)
-            successes[kind] += 1
-            next_episode_idx += 1
-            summary["file"] = final_path.name
-            summary["skipped"] = False
-            summaries.append(summary)
-            kept.append((final_path, kind))
-            print(
-                f"[data] keep {final_path.name} {kind}: "
-                f"{successes[kind]}/{targets[kind]} "
-                f"(ret={summary['return']:.1f}, tail_r={summary['tail_reward']:.2f})"
-            )
-
-        progress = ", ".join(
-            f"{kind}={successes[kind]}/{target}" for kind, target in targets.items()
-        )
-        print(f"[data] success quotas: {progress}")
-
-    shutil.rmtree(candidate_dir, ignore_errors=True)
-    return kept, summaries
-
-
-def summarize_episode(path: Path, kind: str) -> dict:
-    with np.load(path) as ep:
-        rewards = ep["rewards"]
-        tail_steps = min(QUALITY_TAIL_STEPS, len(rewards))
-        tail = slice(-tail_steps, None) if tail_steps else slice(0, 0)
-        heights = ep["torso_height"]
-        uprights = ep["torso_upright"]
-        velocities = ep["horizontal_velocity"]
-        return {
-            "file": path.name,
-            "kind": kind,
-            "steps": int(len(rewards)),
-            "return": float(rewards.sum()) if len(rewards) else 0.0,
-            "mean_height": float(np.nanmean(heights)),
-            "mean_upright": float(np.nanmean(uprights)),
-            "mean_velocity": float(np.nanmean(velocities)),
-            "min_height": float(np.nanmin(heights)),
-            "min_upright": float(np.nanmin(uprights)),
-            "tail_reward": float(np.nanmean(rewards[tail])) if tail_steps else 0.0,
-            "tail_height": float(np.nanmean(heights[tail])) if tail_steps else 0.0,
-            "tail_upright": float(np.nanmean(uprights[tail])) if tail_steps else 0.0,
-            "tail_velocity": float(np.nanmean(velocities[tail])) if tail_steps else 0.0,
-            "max_sigma": float(np.max(ep["sigmas"])) if "sigmas" in ep.files else 0.0,
-        }
-
-
-def tail_recovered(summary: dict) -> bool:
-    return (
-        summary["tail_reward"] >= TAIL_MIN_REWARD
-        and summary["tail_height"] >= TAIL_MIN_HEIGHT
-        and summary["tail_upright"] >= TAIL_MIN_UPRIGHT
-        and summary["tail_velocity"] >= TAIL_MIN_VELOCITY
-    )
-
-
-def has_real_off_manifold_prefix(summary: dict) -> bool:
-    return (
-        summary["min_height"] <= RECOVERY_MAX_MIN_HEIGHT
-        or summary["min_upright"] <= RECOVERY_MAX_MIN_UPRIGHT
-    )
-
-
-def episode_skip_reason(summary: dict) -> str | None:
-    kind = str(summary["kind"])
-    if kind == "clean":
-        if (
-            summary["return"] < CLEAN_MIN_RETURN
-            or summary["mean_height"] < CLEAN_MIN_MEAN_HEIGHT
-            or not tail_recovered(summary)
-        ):
-            return "failed_clean_demo"
-        return None
-
-    if kind == "perturbed":
-        if not tail_recovered(summary):
-            return "failed_perturbed_recovery"
-        return None
-
-    if kind.startswith("recovery/"):
-        if not tail_recovered(summary):
-            return "failed_recovery_tail"
-        if not has_real_off_manifold_prefix(summary):
-            return "not_off_manifold_recovery"
-        return None
-
-    return None
-
-
-def pick_best_clean_episode(paths: list[Path]) -> Path:
-    best_path = paths[0]
-    best_return = -float("inf")
-    for path in paths:
-        with np.load(path) as ep:
-            ret = float(ep["rewards"].sum())
-        if ret > best_return:
-            best_return = ret
-            best_path = path
-    return best_path
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +831,7 @@ def model_config(action_dim: int) -> lewm.LeWMModelConfig:
         predictor_dim_head=PREDICTOR_DIM_HEAD,
         predictor_mlp_dim=PREDICTOR_MLP_DIM,
         predictor_dropout=PREDICTOR_DROPOUT,
+        predictor_conditioning=PREDICTOR_CONDITIONING,
     )
 
 
@@ -1166,6 +843,9 @@ def train_config() -> lewm.LeWMTrainConfig:
         sigreg_weight=SIGREG_WEIGHT,
         sigreg_knots=SIGREG_KNOTS,
         sigreg_num_proj=SIGREG_NUM_PROJ,
+        action_contrast_weight=ACTION_CONTRAST_WEIGHT,
+        action_contrast_margin=ACTION_CONTRAST_MARGIN,
+        action_contrast_horizon=ACTION_CONTRAST_HORIZON,
         batch_size=TRAIN_BATCH_SIZE,
         train_steps=TRAIN_STEPS,
         num_workers=TRAIN_NUM_WORKERS,
@@ -1177,26 +857,32 @@ def train_config() -> lewm.LeWMTrainConfig:
 
 
 def walker_window_weight(ep: dict[str, np.ndarray], start: int, window_pixels: int) -> float:
-    """Task-adapter weighting; src only sees the resulting windows."""
+    """Per-window training weight.
+
+    Task-adapter knowledge: a window where the walker is upright and moving
+    is *much* more informative for learning forward dynamics than a window
+    where it lies still on its back. We weight by mean (height * |upright|),
+    plus a constant floor so the rare "good" frames don't completely
+    dominate. Values are read from the per-step metric arrays the
+    exploration loop records (no oracle, no labels).
+    """
     end = min(start + window_pixels - 1, len(ep["pixels"]) - 1)
-    weight = 1.0
-    meta = metadata_from_array_dict(ep)
-    if bool(meta.get("noisy", False)):
-        weight *= 2.0
-    if meta.get("kind") == "scripted_recovery":
-        weight *= 4.0
-    if "torso_height" in ep:
-        metric_start = max(start - 1, 0)
-        metric_end = max(end - 1, metric_start + 1)
-        h = ep["torso_height"][metric_start:metric_end]
-        if len(h) and float(np.nanmin(h)) < RECOVERY_MAX_MIN_HEIGHT:
-            weight *= 3.0
-    if "torso_upright" in ep:
-        metric_start = max(start - 1, 0)
-        metric_end = max(end - 1, metric_start + 1)
-        up = ep["torso_upright"][metric_start:metric_end]
-        if len(up) and float(np.nanmin(up)) < RECOVERY_MAX_MIN_UPRIGHT:
-            weight *= 2.0
+    # Metrics are per-action-step (one fewer than pixels).
+    metric_start = max(start - 1, 0)
+    metric_end = max(end - 1, metric_start + 1)
+    weight = 1.0  # floor so every window has a non-zero chance.
+    if "torso_height" in ep and "torso_upright" in ep:
+        h = np.asarray(ep["torso_height"][metric_start:metric_end], dtype=np.float32)
+        u = np.asarray(ep["torso_upright"][metric_start:metric_end], dtype=np.float32)
+        if h.size and u.size:
+            # Score in [0, ~1.4]: tall + clearly oriented (either way)
+            # both count, but "tall + upright" gets the biggest bonus.
+            score = float(np.clip(h.mean(), 0.0, 1.4) * np.clip(np.abs(u).mean(), 0.0, 1.0))
+            weight += 6.0 * score
+    if "rewards" in ep:
+        r = np.asarray(ep["rewards"][metric_start:metric_end], dtype=np.float32)
+        if r.size:
+            weight += 4.0 * float(np.clip(r.mean(), 0.0, 1.0))
     return weight
 
 
@@ -1331,96 +1017,6 @@ def recovery_pressure(distance: float, phase: int) -> tuple[float, float]:
 GoalManifold = LatentManifold
 
 
-def metadata_json(ep) -> dict:
-    if "metadata" not in ep.files:
-        return {}
-    raw = ep["metadata"]
-    if hasattr(raw, "item"):
-        raw = raw.item()
-    try:
-        return json.loads(str(raw))
-    except json.JSONDecodeError:
-        return {}
-
-
-def metadata_from_array_dict(ep: dict[str, np.ndarray]) -> dict:
-    if "metadata" not in ep:
-        return {}
-    raw = ep["metadata"]
-    if hasattr(raw, "item"):
-        raw = raw.item()
-    try:
-        return json.loads(str(raw))
-    except json.JSONDecodeError:
-        return {}
-
-
-def stable_frame_mask(ep, num_frames: int) -> np.ndarray:
-    action_steps = max(num_frames - 1, 1)
-    frame_ids = np.arange(num_frames)
-    metric_ids = np.clip(frame_ids - 1, 0, action_steps - 1)
-    mask = frame_ids >= min(GOAL_ORBIT_START, num_frames - 1)
-    for key, threshold in (
-        ("rewards", GOAL_MANIFOLD_MIN_REWARD),
-        ("torso_height", GOAL_MANIFOLD_MIN_HEIGHT),
-        ("torso_upright", GOAL_MANIFOLD_MIN_UPRIGHT),
-        ("horizontal_velocity", GOAL_MANIFOLD_MIN_VELOCITY),
-    ):
-        if key in ep.files:
-            values = ep[key]
-            ids = np.clip(metric_ids, 0, len(values) - 1)
-            mask = mask & (values[ids] >= threshold)
-    return mask
-
-
-def is_high_quality_clean_episode(path: Path) -> bool:
-    with np.load(path) as ep:
-        meta = metadata_json(ep)
-        if meta.get("kind") is not None:
-            return False
-        if bool(meta.get("noisy", False)):
-            return False
-        if len(ep["pixels"]) < GOAL_ORBIT_START + PLAN_HORIZON + 2:
-            return False
-        if "rewards" not in ep.files or "torso_height" not in ep.files:
-            return False
-        tail = slice(max(0, len(ep["rewards"]) - QUALITY_TAIL_STEPS), None)
-        return (
-            float(ep["rewards"][tail].mean()) >= TAIL_MIN_REWARD
-            and float(ep["torso_height"][tail].mean()) >= TAIL_MIN_HEIGHT
-            and float(ep["torso_upright"][tail].mean()) >= TAIL_MIN_UPRIGHT
-            and float(ep["horizontal_velocity"][tail].mean()) >= TAIL_MIN_VELOCITY
-        )
-
-
-def support_transition_mask(ep, num_frames: int) -> np.ndarray:
-    """Task adapter: expose successful transition segments to src manifold code."""
-    stable = stable_frame_mask(ep, num_frames)
-    if stable.sum() < SUPPORT_MIN_MASK_FRAMES:
-        return np.zeros(num_frames, dtype=bool)
-    tail_n = min(SUPPORT_TAIL_STABLE_STEPS, num_frames)
-    if not bool(stable[-tail_n:].all()):
-        return np.zeros(num_frames, dtype=bool)
-
-    meta = metadata_json(ep)
-    action_steps = max(num_frames - 1, 1)
-    has_off_manifold = bool(meta.get("kind") == "scripted_recovery" or meta.get("noisy", False))
-    if "torso_height" in ep.files:
-        has_off_manifold = has_off_manifold or float(np.nanmin(ep["torso_height"][:action_steps])) < RECOVERY_MAX_MIN_HEIGHT
-    if "torso_upright" in ep.files:
-        has_off_manifold = has_off_manifold or float(np.nanmin(ep["torso_upright"][:action_steps])) < RECOVERY_MAX_MIN_UPRIGHT
-    if not has_off_manifold:
-        return np.zeros(num_frames, dtype=bool)
-
-    first_stable = int(np.argmax(stable))
-    if meta.get("kind") == "scripted_recovery":
-        start = 0
-    else:
-        start = max(min(GOAL_ORBIT_START, num_frames - 1), first_stable - PLAN_HORIZON)
-    mask = np.zeros(num_frames, dtype=bool)
-    mask[start:] = True
-    return mask
-
 
 def subsample_rows(values: torch.Tensor, max_rows: int) -> torch.Tensor:
     if values.size(0) <= max_rows:
@@ -1480,14 +1076,30 @@ def nearest_neighbor_mse_stats(values: torch.Tensor, max_points: int = 1024) -> 
 def build_goal_manifold(
     model,
     goal_pixels: np.ndarray,
-    goal_ep,
+    goal_ep: dict[str, np.ndarray],
     device: torch.device,
 ) -> LatentManifold:
-    segments: list[SuccessSegment] = []
-    goal_meta = metadata_json(goal_ep)
-    skipped_source = str(goal_meta.get("source_episode", ""))
+    """Build the goal/support latent manifold from oracle-free explore data.
 
-    def add_source(name: str, ep, pixels: np.ndarray, role: str, mask: np.ndarray) -> None:
+    The synthetic goal trajectory (picked post-hoc from the dataset) provides
+    one segment with role="goal". Every explore episode contributes whatever
+    frames pass ``goal_frame_mask`` (extra "goal" support) and whatever frames
+    pass ``fall_frame_mask`` (role="support", used as repulsion if weight > 0).
+    """
+    segments: list[SuccessSegment] = []
+    goal_meta_raw = goal_ep.get("metadata") if isinstance(goal_ep, dict) else None
+    try:
+        goal_meta = json.loads(str(goal_meta_raw.item() if hasattr(goal_meta_raw, "item") else goal_meta_raw)) if goal_meta_raw is not None else {}
+    except (json.JSONDecodeError, AttributeError):
+        goal_meta = {}
+    # The goal trajectory is a concatenation of the best segments from
+    # multiple episodes; the contributing episodes are already aggregated
+    # into the goal segment, so when we iterate over the dataset we don't
+    # need to special-case any single one (segments are still individually
+    # supplied via goal_frame_mask below).
+    _ = goal_meta  # currently unused but kept for future use.
+
+    def add_source(name: str, pixels: np.ndarray, role: str, mask: np.ndarray) -> None:
         if int(mask.sum()) < SUPPORT_MIN_MASK_FRAMES:
             return
         segments.append(
@@ -1496,20 +1108,27 @@ def build_goal_manifold(
                 pixels=pixels.copy(),
                 mask=mask.astype(bool),
                 role=role,
-                metadata=metadata_json(ep),
+                metadata={"source": name},
             )
         )
 
-    add_source("goal_trajectory", goal_ep, goal_pixels, "goal", stable_frame_mask(goal_ep, len(goal_pixels)))
+    # Goal trajectory: a synthetic, contiguous "walking" segment selected
+    # from the exploration dataset.  Use the whole thing as goal.
+    add_source(
+        "goal_trajectory",
+        goal_pixels,
+        "goal",
+        np.ones(len(goal_pixels), dtype=bool),
+    )
+
+    # Every episode contributes: (a) any extra goal-like frames, and
+    # (b) any fall-like frames as repulsion support.
     for path in sorted(DATASET_DIR.glob("episode_*.npz")):
-        if path.name == skipped_source:
-            continue
-        with np.load(path) as ep:
-            pixels = ep["pixels"]
-            if is_high_quality_clean_episode(path):
-                add_source(path.name, ep, pixels, "goal", stable_frame_mask(ep, len(pixels)))
-            support_mask = support_transition_mask(ep, len(pixels))
-            add_source(path.name, ep, pixels, "support", support_mask)
+        with np.load(path) as ep_npz:
+            ep = {k: ep_npz[k] for k in ep_npz.files}
+        pixels = ep["pixels"]
+        add_source(path.name + ":goal", pixels, "goal", goal_frame_mask(ep))
+        add_source(path.name + ":fall", pixels, "support", fall_frame_mask(ep))
 
     return build_latent_manifold(
         segments,
@@ -1694,6 +1313,11 @@ def lewm_cem_plan(
             prior_tie_abs=CEM_PRIOR_TIE_ABS,
             cost_scale_min=MANIFOLD_COST_SCALE_MIN,
             near_delta_weight=NEAR_DELTA_WEIGHT,
+            prior_in_mean=CEM_PRIOR_IN_MEAN,
+            prior_in_samples=CEM_PRIOR_IN_SAMPLES,
+            state_cost_clip=CEM_STATE_COST_CLIP,
+            delta_cost_clip=CEM_DELTA_COST_CLIP,
+            near_cost_clip=CEM_NEAR_COST_CLIP,
         ),
         PlannerWeights(
             state=W_STATE,
@@ -1728,10 +1352,11 @@ def lewm_cem_plan(
 @torch.no_grad()
 def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
     model, device = load_lewm(ckpt_path, action_dim)
-    with np.load(DATASET_DIR / "goal_trajectory.npz") as goal:
-        goal_pixels = goal["pixels"].copy()
-        goal_actions_np = goal["actions"].astype(np.float32)
-        goal_manifold = build_goal_manifold(model, goal_pixels, goal, device)
+    with np.load(DATASET_DIR / "goal_trajectory.npz") as goal_npz:
+        goal_ep = {k: goal_npz[k] for k in goal_npz.files}
+    goal_pixels = goal_ep["pixels"]
+    goal_actions_np = goal_ep["actions"].astype(np.float32)
+    goal_manifold = build_goal_manifold(model, goal_pixels, goal_ep, device)
 
     goal_latents = encode_frames(model, goal_pixels, device)
     goal_actions = torch.from_numpy(goal_actions_np).to(device)

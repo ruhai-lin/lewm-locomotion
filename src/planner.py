@@ -27,6 +27,36 @@ class PlannerConfig:
     prior_tie_abs: float = 0.0
     cost_scale_min: float = 1e-4
     near_delta_weight: float = 0.0
+    # Prior usage knobs (E5). With a well-trained action-sensitive predictor the
+    # prior should be a soft regulariser, not a structural cheat. Defaults give
+    # the legacy "prior wins by construction" behaviour; the recommended new
+    # setting is prior_in_mean=False, prior_in_samples=False, and the prior
+    # term should appear only via PlannerWeights.action_prior.
+    prior_in_mean: bool = True
+    prior_in_samples: bool = True
+    repulsion_eps: float = 1e-6
+    # Saturating clip for the (normalised) state and delta nearest-neighbour
+    # costs. With a small goal manifold (state_scale tight, support coverage
+    # large) the *absolute* state cost can be hundreds of manifold-radii away
+    # from goal, swamping every other term and reducing CEM to "try to
+    # teleport to goal in one plan". Clipping at a soft horizon converts the
+    # cost into an *attraction barrier* once you're far away (no usable
+    # gradient direction toward goal anyway, since the latent space outside
+    # the manifold is unexplored), letting the smooth/delta/near terms shape
+    # behaviour. Set <= 0 to disable.
+    # Saturating clips on the normalised costs.  Off (=0) by default; flip on
+    # only when the goal manifold is far from where eval lives and the
+    # unbounded growth of state/near cost would swamp the other terms. The
+    # E6 experiment showed that with a "1 oracle goal + 128 explore" dataset
+    # the goal manifold sits on the env reset attractor so clipping is not
+    # needed; with a fully oracle-free goal manifold the latent space ends
+    # up as two disjoint islands and clipping creates a flat surface where
+    # CEM cannot beat the prior at all — both modes are documented in
+    # experiments.md E6/E7.
+    state_cost_clip: float = 0.0
+    delta_cost_clip: float = 0.0
+    support_cost_clip: float = 0.0
+    near_cost_clip: float = 0.0
 
     @property
     def horizon(self) -> int:
@@ -37,8 +67,13 @@ class PlannerConfig:
 class PlannerWeights:
     state: float = 0.3
     delta: float = 4.0
-    support_state: float = 0.5
-    support_delta: float = 2.0
+    # ``support_*`` were originally an "alternative success" term but were used
+    # at zero weight in the baseline. We reinterpret them as **repulsion**
+    # weights: distance to the support manifold (off-orbit / fallen latents)
+    # should be *maximised*, not minimised. Negative-style cost via
+    # 1 / (dist + eps), see PlannerConfig.repulsion_eps.
+    support_state: float = 0.0
+    support_delta: float = 0.0
     near: float = 0.01
     action_prior: float = 0.01
     smooth: float = 0.08
@@ -124,11 +159,18 @@ class LatentCEMPlanner:
     ) -> tuple[torch.Tensor, dict[str, float]]:
         action_dim = low.numel()
         prior_blocks = block_actions_from_step_actions(prior_actions, self.cfg).to(low.device)
+        # CEM mean: either the prior (legacy behaviour) or zero (the new
+        # default once the predictor is action-sensitive). Warm-start
+        # blending applies on top.
+        if self.cfg.prior_in_mean:
+            base_mean = prior_blocks
+        else:
+            base_mean = torch.zeros_like(prior_blocks)
         if warm_start_blocks is None or self.cfg.warm_start_blend <= 0.0:
-            mean = prior_blocks
+            mean = base_mean
         else:
             warm = warm_start_blocks.to(low.device).float()
-            mean = self.cfg.warm_start_blend * warm + (1.0 - self.cfg.warm_start_blend) * prior_blocks
+            mean = self.cfg.warm_start_blend * warm + (1.0 - self.cfg.warm_start_blend) * base_mean
         mean = torch.clamp(mean, low, high)
         std_value = float(self.cfg.init_std if init_std is None else init_std)
         if self.cfg.max_std is not None:
@@ -169,7 +211,11 @@ class LatentCEMPlanner:
                 device=low.device,
             )
             block_samples = torch.clamp(mean.unsqueeze(0) + std.unsqueeze(0) * eps, low, high)
-            block_samples[0] = prior_blocks
+            # Slot 0 is the *prior* — only injected when the legacy
+            # prior_in_samples flag is True. With prior_in_samples=False the
+            # prior has to win on cost alone, just like every other sample.
+            if self.cfg.prior_in_samples:
+                block_samples[0] = prior_blocks
             if self.cfg.samples > 1:
                 block_samples[1] = mean
             if (
@@ -194,18 +240,35 @@ class LatentCEMPlanner:
             pred_deltas = pred_with_current[:, 1:] - pred_with_current[:, :-1]
             goal_state_cost = nearest_point_sequence_mse(pred.float(), state_points, horizon_weights) / state_scale
             goal_delta_cost = nearest_point_sequence_mse(pred_deltas, delta_points, horizon_weights) / delta_scale
-            support_state_cost = (
-                nearest_point_sequence_mse(pred.float(), support_state_points, horizon_weights)
-                / support_state_scale
-            )
-            support_delta_cost = (
-                nearest_point_sequence_mse(pred_deltas, support_delta_points, horizon_weights)
-                / support_delta_scale
-            )
-            # The planner target is the successful locomotion manifold. Support
-            # trajectories are useful for learning off-manifold dynamics, but
-            # treating their early fallen states as low-cost targets makes CEM
-            # comfortable staying on the ground.
+            if self.cfg.state_cost_clip > 0.0:
+                goal_state_cost = goal_state_cost.clamp_max(self.cfg.state_cost_clip)
+            if self.cfg.delta_cost_clip > 0.0:
+                goal_delta_cost = goal_delta_cost.clamp_max(self.cfg.delta_cost_clip)
+            # Support (off-manifold / fallen) latents are *repulsion* targets:
+            # we want predicted latents to be *far* from them, so the cost is
+            # 1 / (dist + eps) — smaller distance → larger cost. The same
+            # transform is applied in normalised manifold units so it can be
+            # blended with the goal costs by a single weight.  When the
+            # support manifold is empty (no off-manifold demonstrations) we
+            # emit zero cost, not 1/eps.
+            if support_state_points.size(0) > 0:
+                raw_support_state = (
+                    nearest_point_sequence_mse(pred.float(), support_state_points, horizon_weights)
+                    / support_state_scale
+                )
+                support_state_cost = 1.0 / (raw_support_state + self.cfg.repulsion_eps)
+            else:
+                support_state_cost = pred.new_zeros((pred.size(0),))
+            if support_delta_points.size(0) > 0:
+                raw_support_delta = (
+                    nearest_point_sequence_mse(pred_deltas, support_delta_points, horizon_weights)
+                    / support_delta_scale
+                )
+                support_delta_cost = 1.0 / (raw_support_delta + self.cfg.repulsion_eps)
+            else:
+                support_delta_cost = pred.new_zeros((pred.size(0),))
+            # The planner target is the successful locomotion manifold; the
+            # support manifold contributes as repulsion.
             state_cost = goal_state_cost
             delta_cost = goal_delta_cost
 
@@ -219,6 +282,8 @@ class LatentCEMPlanner:
                 near_cost = near_cost + self.cfg.near_delta_weight * (
                     weighted_horizon_mean(near_delta_raw, horizon_weights[1:]) / delta_scale
                 )
+            if self.cfg.near_cost_clip > 0.0:
+                near_cost = near_cost.clamp_max(self.cfg.near_cost_clip)
 
             # Action costs live in actuator units, while state/delta costs live
             # in normalized latent units.  Measure deviations from the demo
@@ -241,8 +306,8 @@ class LatentCEMPlanner:
 
             weighted_state = self.weights.state * state_cost
             weighted_delta = self.weights.delta * delta_cost
-            weighted_support_state = support_state_cost.new_zeros(support_state_cost.shape)
-            weighted_support_delta = support_delta_cost.new_zeros(support_delta_cost.shape)
+            weighted_support_state = self.weights.support_state * support_state_cost
+            weighted_support_delta = self.weights.support_delta * support_delta_cost
             weighted_near = self.weights.near * near_cost
             weighted_prior = action_prior_weight_value * prior_cost
             weighted_smooth = smooth_weight_value * smooth_cost

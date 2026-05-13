@@ -4,3 +4,7 @@ outputs/
 references/
 legacy/
 datasets/
+scripts/
+
+experiments.md
+src/diagnostics/
