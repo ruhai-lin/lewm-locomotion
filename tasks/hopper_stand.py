@@ -1,14 +1,19 @@
-"""LeWM-CEM pipeline for dm_control cheetah/run.
+"""LeWM-CEM pipeline for dm_control hopper/stand.
 
-Same shape as ``tasks/walker_walk.py``; differs in:
+Same shape as ``tasks/walker_walk.py`` (everything generic lives in
+``src/``); only the task-specific pieces differ:
 * env identity (DOMAIN / TASK / dt / action_dim);
-* ``diagnostics`` (uses ``physics.speed()`` and torso z as height proxy);
-* ``goal_frame_mask`` / ``fall_frame_mask`` thresholds (cheetah runs on
-  belly-height, so we filter on forward speed, not on "upright");
-* ``oracle_score_fn`` (cheetah: maximise forward speed).
+* ``diagnostics`` (uses ``physics.height()`` and ``physics.speed()``);
+* ``goal_frame_mask`` / ``fall_frame_mask`` thresholds;
+* ``oracle_score_fn`` (stand: body height + small control).
+
+We use the ``stand`` variant rather than ``hop`` because pure-random
+oracle CEM cannot solve hopper/hop (sparse stand x hop reward; see
+``README.md`` "Limitations"). Stand has a dense reward and is reliably
+solved by the same CEM recipe as walker / cheetah.
 
 Run:
-    uv run python tasks/cheetah_run.py
+    uv run python tasks/hopper_stand.py
 """
 
 from __future__ import annotations
@@ -40,15 +45,15 @@ from src.planner import PlannerWeights
 # ---------------------------------------------------------------------------
 
 
-DOMAIN = "cheetah"
-TASK = "run"
+DOMAIN = "hopper"
+TASK = "stand"
 SEED = 42
 
-DATASET_DIR = Path("datasets/cheetah_run")
-OUT_DIR = Path("outputs/cheetah_run")
+DATASET_DIR = Path("datasets/hopper_stand")
+OUT_DIR = Path("outputs/hopper_stand")
 CKPT_DIR = OUT_DIR / "ckpt"
 TRAIN_LOG_PATH = OUT_DIR / "train_log.jsonl"
-DATASET_VERSION = 2  # bumped: cheetah oracle uses longer horizon + sane shaping.
+DATASET_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +66,8 @@ DATASET_CAMERA_ID = 0
 VIDEO_CAMERA_ID = 0
 VIDEO_WIDTH = 640
 VIDEO_HEIGHT = 480
-VIDEO_FPS = 100
-DT = 0.01  # cheetah control_timestep.
+VIDEO_FPS = 50
+DT = 0.02  # hopper control_timestep.
 
 DATASET_N_EPISODES = 128
 DATASET_EPISODE_STEPS = 400
@@ -71,45 +76,37 @@ DATASET_MP_START_METHOD = "forkserver"
 
 
 # ---------------------------------------------------------------------------
-# Goal- and fall-frame thresholds. Cheetah's task reward saturates at
-# speed >= 10; we ask for at least modest forward motion to count as goal.
+# Goal- and fall-frame thresholds.
+# "Good" frames for hopper/stand: body high and approximately stationary.
 # ---------------------------------------------------------------------------
 
 
-GOAL_FRAME_MIN_REWARD = 0.05
-GOAL_FRAME_MIN_SPEED = 1.0
-GOAL_FRAME_MIN_TORSO_Z = 0.3
+GOAL_FRAME_MIN_REWARD = 0.4   # dm_control stand reward saturates at ~1.0; 0.4 = "clearly standing".
+GOAL_FRAME_MIN_HEIGHT = 0.8
 GOAL_MIN_SEGMENT_LEN = 4
 
-SUPPORT_FRAME_MAX_TORSO_Z = 0.15  # belly on the ground / flipped.
-SUPPORT_FRAME_MIN_SPEED_FOR_FALL = -0.5  # going backwards counts as off-manifold.
+SUPPORT_FRAME_MAX_HEIGHT = 0.5  # collapsed / lying on side.
 
 
 # ---------------------------------------------------------------------------
-# Oracle CEM reward shaping (cheetah: maximise forward speed).
+# Oracle CEM reward shaping (hopper/stand: maximise env reward = stand x small_control).
 # ---------------------------------------------------------------------------
 
 
-# Cheetah's task is well within reach of pure-random CEM (its random
-# explore episodes already get return ~40); oracle should produce a much
-# better goal trajectory in ~5 minutes. Flip to False to skip and rely on
-# the best explore episode instead.
+# hopper/stand is dense (stand x small_control, both smooth). Pure-random
+# CEM solves it with the shared default config; no shaping needed.
 USE_ORACLE_GOAL_DEMO = True
 
-ORACLE_TARGET_SPEED = 10.0  # dm_control cheetah/run reward saturates at 10 m/s.
-ORACLE_PROGRESS_BONUS = 0.5
-ORACLE_SPEED_TRACKING_BONUS = 0.5
-ORACLE_ACTION_PENALTY = 0.002
+ORACLE_REWARD_GAMMA = 0.98
+ORACLE_ACTION_PENALTY = 0.005
 ORACLE_ACTION_SMOOTHNESS_PENALTY = 0.005
-ORACLE_REWARD_GAMMA = 0.99
 
-# Cheetah's control_timestep is 0.01 -> 20-step plan = 0.2 s, very short.
-# Lengthening lets the oracle commit to gait cycles.
-ORACLE_PLAN_HORIZON = 30
-ORACLE_CEM_SAMPLES = 128
-ORACLE_CEM_TOPK = 16
-ORACLE_CEM_ITERS = 4
-ORACLE_CEM_INIT_STD = 0.6
+# Shared CEM strength across walker/walk, cheetah/run, hopper/stand.
+ORACLE_PLAN_HORIZON = 40
+ORACLE_CEM_SAMPLES = 512
+ORACLE_CEM_TOPK = 64
+ORACLE_CEM_ITERS = 6
+ORACLE_CEM_INIT_STD = 0.55
 ORACLE_CEM_MIN_STD = 0.06
 ORACLE_CEM_MOMENTUM = 0.15
 
@@ -256,14 +253,17 @@ def render_video_frame(env) -> np.ndarray:
 
 
 def diagnostics(env) -> dict[str, float]:
-    """Cheetah per-step task metrics. The task is to maximise forward
-    speed; torso_z is an "off the ground" proxy."""
+    """Hopper per-step task metrics. The two task-relevant quantities are
+    body height (controls whether the hopper is on the ground) and forward
+    speed; everything else is derived from those."""
     out = {
+        "height": float("nan"),
         "speed": float("nan"),
         "torso_x": float("nan"),
         "torso_z": float("nan"),
     }
     try:
+        out["height"] = float(env.physics.height())
         out["speed"] = float(env.physics.speed())
         out["torso_x"] = float(env.physics.named.data.xpos["torso", "x"])
         out["torso_z"] = float(env.physics.named.data.xpos["torso", "z"])
@@ -287,7 +287,7 @@ def discounted_sum(rewards: Iterable[float], gamma: float) -> float:
 
 
 def goal_frame_mask(ep: dict[str, np.ndarray]) -> np.ndarray:
-    """True wherever the cheetah is upright-ish and running forward."""
+    """True wherever the hopper is upright and the env reward is high."""
     num_frames = len(ep["pixels"])
     if num_frames == 0:
         return np.zeros(0, dtype=bool)
@@ -296,8 +296,7 @@ def goal_frame_mask(ep: dict[str, np.ndarray]) -> np.ndarray:
     mask = np.ones(num_frames, dtype=bool)
     for key, threshold in (
         ("rewards", GOAL_FRAME_MIN_REWARD),
-        ("speed", GOAL_FRAME_MIN_SPEED),
-        ("torso_z", GOAL_FRAME_MIN_TORSO_Z),
+        ("height", GOAL_FRAME_MIN_HEIGHT),
     ):
         if key in ep:
             arr = np.asarray(ep[key])
@@ -306,19 +305,16 @@ def goal_frame_mask(ep: dict[str, np.ndarray]) -> np.ndarray:
 
 
 def fall_frame_mask(ep: dict[str, np.ndarray]) -> np.ndarray:
-    """True wherever the cheetah is belly-down or moving backwards."""
+    """True wherever the hopper looks collapsed."""
     num_frames = len(ep["pixels"])
     if num_frames == 0:
         return np.zeros(0, dtype=bool)
     action_steps = max(num_frames - 1, 1)
     metric_ids = np.clip(np.arange(num_frames) - 1, 0, action_steps - 1)
     out = np.zeros(num_frames, dtype=bool)
-    if "torso_z" in ep:
-        z = np.asarray(ep["torso_z"])
-        out = out | (z[np.clip(metric_ids, 0, len(z) - 1)] <= SUPPORT_FRAME_MAX_TORSO_Z)
-    if "speed" in ep:
-        s = np.asarray(ep["speed"])
-        out = out | (s[np.clip(metric_ids, 0, len(s) - 1)] <= SUPPORT_FRAME_MIN_SPEED_FOR_FALL)
+    if "height" in ep:
+        h = np.asarray(ep["height"])
+        out = out | (h[np.clip(metric_ids, 0, len(h) - 1)] <= SUPPORT_FRAME_MAX_HEIGHT)
     return out
 
 
@@ -333,31 +329,28 @@ def oracle_score_fn(
     actions: np.ndarray,
     previous_action: np.ndarray,
 ) -> float:
+    """Hopper/stand score = discounted env reward minus action regularisers.
+
+    The dm_control hopper/stand reward is already dense
+    (``standing(height>=0.6) * small_control``), so no extra shaping is
+    needed — both factors are smooth in (state, action) and CEM can climb
+    them directly.
+    """
     oracle_env.reset()
     oracle_env.physics.set_state(state0)
     oracle_env.physics.forward()
-    start_x = float(oracle_env.physics.named.data.xpos["torso", "x"])
     rewards: list[float] = []
     last_action = previous_action
-    smooth_cost = speed_tracking = 0.0
+    smooth_cost = 0.0
     for action in actions:
         ts = oracle_env.step(action.astype(np.float32))
-        speed = float(oracle_env.physics.speed())
         rewards.append(float(ts.reward or 0.0))
         smooth_cost += float(np.mean((action - last_action) ** 2))
-        # Tracking is one-sided: we only reward approaching the target,
-        # not penalize blowing past it (cheetah/run wants max forward speed).
-        speed_tracking += min(speed / ORACLE_TARGET_SPEED, 1.5)
         last_action = action
         if ts.last():
             break
-    final_x = float(oracle_env.physics.named.data.xpos["torso", "x"])
-    progress = max(final_x - start_x, 0.0)
-    n = max(len(rewards), 1)
     return (
         discounted_sum(rewards, ORACLE_REWARD_GAMMA)
-        + ORACLE_PROGRESS_BONUS * progress
-        + ORACLE_SPEED_TRACKING_BONUS * (speed_tracking / n)
         - ORACLE_ACTION_PENALTY * float(np.mean(actions**2))
         - ORACLE_ACTION_SMOOTHNESS_PENALTY * smooth_cost
     )
@@ -369,7 +362,7 @@ def oracle_score_fn(
 
 
 datasets.register_task(
-    "cheetah_run",
+    "hopper_stand",
     datasets.TaskHandles(
         env_fn=make_env,
         render_fn=render_dataset_frame,
@@ -414,8 +407,8 @@ def build_static_dataset() -> None:
 
     collect_metadata = datasets.collect_dataset(
         out_dir=DATASET_DIR,
-        task_name="cheetah_run",
-        task_module="tasks.cheetah_run",
+        task_name="hopper_stand",
+        task_module="tasks.hopper_stand",
         config=datasets.CollectConfig(
             n_episodes=DATASET_N_EPISODES,
             episode_steps=DATASET_EPISODE_STEPS,
@@ -425,8 +418,8 @@ def build_static_dataset() -> None:
         ),
     )
 
+    # Optional oracle demo + best-explore fallback.
     oracle_return = -float("inf")
-    oracle_demo = None
     if USE_ORACLE_GOAL_DEMO:
         print("[data] collecting 1 oracle-CEM goal demo...")
         oracle_demo = datasets.collect_oracle_goal_demo(
@@ -454,7 +447,9 @@ def build_static_dataset() -> None:
         oracle_return = float(oracle_demo["rewards"].sum())
         print(f"[data] oracle demo: return={oracle_return:.1f} -> {oracle_path.name}")
     else:
-        print("[data] oracle goal demo skipped (USE_ORACLE_GOAL_DEMO=False).")
+        print("[data] oracle goal demo skipped (USE_ORACLE_GOAL_DEMO=False); "
+              "using best explore episode as goal trajectory.")
+        oracle_demo = None
 
     best_explore_idx = max(
         range(len(collect_metadata["episodes"])),

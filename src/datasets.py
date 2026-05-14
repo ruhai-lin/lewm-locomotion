@@ -608,3 +608,159 @@ def render_goal_manifold(
         f"-> {video_path}"
     )
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Oracle CEM with simulator state-restoring rollouts.
+#
+# Used **only** to produce a single "goal demo" trajectory that begins from
+# the env reset pose and reaches a successful state. The N explore
+# episodes that LeWM trains on remain oracle-free; this is the "+1" in the
+# "N + 1" dataset. The algorithm is task-agnostic: tasks inject a
+# ``score_fn`` callable that scores a candidate action sequence by
+# replaying it in a state-restoring oracle env. Everything else (CEM
+# optimisation, episode driver, per-step metric recording) lives here.
+# ---------------------------------------------------------------------------
+
+
+# ``score_fn(oracle_env, state0, actions, previous_action) -> float`` — higher is better.
+ScoreFn = Callable[[object, np.ndarray, np.ndarray, np.ndarray], float]
+
+
+@dataclass(frozen=True)
+class OracleCEMConfig:
+    plan_horizon: int = 40
+    samples: int = 512
+    topk: int = 64
+    iters: int = 6
+    init_std: float = 0.55
+    min_std: float = 0.06
+    momentum: float = 0.15
+
+
+def oracle_cem_plan(
+    oracle_env,
+    state0: np.ndarray,
+    low: np.ndarray,
+    high: np.ndarray,
+    init_mean: np.ndarray,
+    previous_action: np.ndarray,
+    rng: np.random.Generator,
+    score_fn: ScoreFn,
+    cfg: OracleCEMConfig,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return ``(best_first_action, refined_mean, best_score)``."""
+    action_dim = low.shape[0]
+    mean = init_mean.astype(np.float32).copy()
+    std = np.full_like(mean, cfg.init_std, dtype=np.float32)
+    topk = min(cfg.topk, cfg.samples)
+    best_plan: np.ndarray | None = None
+    best_score = -float("inf")
+    for _ in range(cfg.iters):
+        samples = rng.normal(
+            loc=mean[None],
+            scale=std[None],
+            size=(cfg.samples, cfg.plan_horizon, action_dim),
+        ).astype(np.float32)
+        samples[0] = mean
+        samples = np.clip(samples, low.reshape(1, 1, -1), high.reshape(1, 1, -1))
+        scores = np.empty(samples.shape[0], dtype=np.float32)
+        for i in range(samples.shape[0]):
+            scores[i] = score_fn(oracle_env, state0, samples[i], previous_action)
+        elite_idx = np.argpartition(-scores, topk - 1)[:topk]
+        elites = samples[elite_idx]
+        elite_mean = elites.mean(axis=0).astype(np.float32)
+        elite_std = np.maximum(elites.std(axis=0), cfg.min_std).astype(np.float32)
+        mean = (1.0 - cfg.momentum) * elite_mean + cfg.momentum * mean
+        std = elite_std
+        i_best = int(np.argmax(scores))
+        if float(scores[i_best]) > best_score:
+            best_score = float(scores[i_best])
+            best_plan = samples[i_best].copy()
+    assert best_plan is not None
+    return best_plan[0].astype(np.float32), mean.astype(np.float32), best_score
+
+
+def collect_oracle_goal_demo(
+    *,
+    env_fn: Callable[[int], object],
+    action_bounds_fn: Callable[[object], tuple[np.ndarray, np.ndarray]],
+    render_fn: Callable[[object], np.ndarray],
+    record_fn: Callable[[object], dict[str, float]],
+    score_fn: ScoreFn,
+    episode_steps: int,
+    seed: int,
+    cfg: OracleCEMConfig = OracleCEMConfig(),
+    domain: str = "",
+    task: str = "",
+    desc: str = "oracle goal",
+) -> dict[str, np.ndarray]:
+    """Run one episode under oracle CEM and return the recorded arrays.
+
+    The returned dict has the same schema as the explore episodes:
+    ``pixels``, ``actions``, ``rewards``, plus any per-step scalar metrics
+    from ``record_fn`` (e.g. ``torso_height``), and a JSON ``metadata`` blob.
+    """
+    rng = np.random.default_rng(seed)
+    env = env_fn(seed)
+    oracle_env = env_fn(seed + 10_000)
+    low, high = action_bounds_fn(env)
+    action_dim = int(low.shape[0])
+    env.reset()
+    plan_mean = np.zeros((cfg.plan_horizon, action_dim), dtype=np.float32)
+    previous_action = np.zeros(action_dim, dtype=np.float32)
+
+    pixels = [render_fn(env)]
+    actions: list[np.ndarray] = []
+    rewards: list[float] = []
+    metrics_acc: dict[str, list[float]] = {}
+
+    from tqdm import tqdm  # local import to avoid leaking into module-level api.
+
+    bar = tqdm(range(episode_steps), desc=desc, dynamic_ncols=True)
+    for _step in bar:
+        state0 = env.physics.get_state().copy()
+        action, plan_mean, _score = oracle_cem_plan(
+            oracle_env, state0, low, high, plan_mean, previous_action, rng, score_fn, cfg
+        )
+        plan_mean = np.concatenate(
+            [plan_mean[1:], np.zeros((1, action_dim), dtype=np.float32)],
+            axis=0,
+        )
+        ts = env.step(action)
+        pixels.append(render_fn(env))
+        actions.append(action.copy())
+        rewards.append(float(ts.reward or 0.0))
+        for key, value in record_fn(env).items():
+            metrics_acc.setdefault(key, []).append(float(value))
+        previous_action = action
+        postfix = {"ret": f"{sum(rewards):.1f}"}
+        latest = {k: v[-1] for k, v in metrics_acc.items() if v}
+        for k, v in latest.items():
+            postfix[k[:8]] = f"{v:.2f}"
+        bar.set_postfix(postfix)
+        if ts.last():
+            break
+    bar.close()
+    env.close()
+    oracle_env.close()
+
+    record: dict[str, np.ndarray] = {
+        "pixels": np.stack(pixels, axis=0).astype(np.uint8),
+        "actions": np.stack(actions, axis=0).astype(np.float32),
+        "rewards": np.asarray(rewards, dtype=np.float32),
+    }
+    for key, values in metrics_acc.items():
+        record[key] = np.asarray(values, dtype=np.float32)
+    record["metadata"] = np.asarray(
+        json.dumps(
+            {
+                "kind": "oracle_goal_demo",
+                "domain": domain,
+                "task": task,
+                "seed": seed,
+                "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
+            }
+        )
+    )
+    return record

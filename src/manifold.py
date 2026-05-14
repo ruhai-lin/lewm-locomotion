@@ -271,3 +271,83 @@ def build_latent_manifold(
         diagnostics=diagnostics,
     )
 
+
+
+# ---------------------------------------------------------------------------
+# High-level goal manifold builder (used by eval).
+# Task adapters provide ``goal_frame_mask_fn`` / ``fall_frame_mask_fn`` to
+# decide which frames in the dataset are "goal" vs "off-manifold support".
+# ---------------------------------------------------------------------------
+
+
+FrameMaskFn = Callable[[dict[str, np.ndarray]], np.ndarray]
+
+
+@torch.no_grad()
+def build_goal_manifold(
+    *,
+    dataset_dir,
+    goal_pixels: np.ndarray,
+    encode_frames: EncodeFramesFn,
+    goal_frame_mask_fn: FrameMaskFn,
+    fall_frame_mask_fn: FrameMaskFn | None,
+    plan_horizon: int,
+    min_mask_frames: int,
+    max_state_points: int = 4096,
+    max_delta_points: int = 4096,
+    max_segments: int = 4096,
+    cost_scale_min: float = 1e-4,
+    device: torch.device | None = None,
+) -> LatentManifold:
+    """Build the goal/support latent manifold from a dataset directory.
+
+    - The explicit ``goal_pixels`` trajectory becomes the canonical goal
+      segment (full mask).
+    - Every ``episode_*.npz`` in ``dataset_dir`` contributes goal frames
+      where ``goal_frame_mask_fn(ep)`` is True and support (off-manifold)
+      frames where ``fall_frame_mask_fn(ep)`` is True (if provided).
+    """
+    from pathlib import Path as _Path  # local import to avoid top-level clutter
+
+    dataset_dir = _Path(dataset_dir)
+    segments: list[SuccessSegment] = []
+
+    def _add(name: str, pixels: np.ndarray, role: str, mask: np.ndarray) -> None:
+        if int(mask.sum()) < min_mask_frames:
+            return
+        segments.append(
+            SuccessSegment(
+                name=name,
+                pixels=pixels.copy(),
+                mask=mask.astype(bool),
+                role=role,
+                metadata={"source": name},
+            )
+        )
+
+    _add(
+        "goal_trajectory",
+        goal_pixels,
+        "goal",
+        np.ones(len(goal_pixels), dtype=bool),
+    )
+    for path in sorted(dataset_dir.glob("episode_*.npz")):
+        with np.load(path) as ep_npz:
+            ep = {k: ep_npz[k] for k in ep_npz.files}
+        pixels = ep["pixels"]
+        _add(path.name + ":goal", pixels, "goal", goal_frame_mask_fn(ep))
+        if fall_frame_mask_fn is not None:
+            _add(path.name + ":fall", pixels, "support", fall_frame_mask_fn(ep))
+
+    return build_latent_manifold(
+        segments,
+        encode_frames=encode_frames,
+        config=ManifoldConfig(
+            horizon=plan_horizon,
+            max_state_points=max_state_points,
+            max_delta_points=max_delta_points,
+            max_segments=max_segments,
+            cost_scale_min=cost_scale_min,
+        ),
+        device=device or torch.device("cpu"),
+    )
