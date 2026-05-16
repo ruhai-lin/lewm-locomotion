@@ -642,15 +642,11 @@ class LeWMTrainConfig:
     sigreg_weight: float = 0.05
     sigreg_knots: int = 17
     sigreg_num_proj: int = 1024
-    # Action-contrast loss (experiment E4): forces the predictor to produce
-    # measurably different latents under different actions. Without this, the
-    # one-step pred loss is satisfiable by extrapolating visual context and
-    # ignoring actions, which leaves CEM with no signal in the action
-    # variable. ``action_contrast_weight = 0`` reproduces the original
-    # upstream LeWM loss. See experiments.md E4.
+    # Action-contrast loss (experiment E4 ablation): forces the predictor
+    # to produce measurably different latents under different actions.
+    # Hardcoded margin=0 / horizon=8 — only the weight is a knob.
+    # ``action_contrast_weight = 0`` reproduces the upstream LeWM loss.
     action_contrast_weight: float = 0.0
-    action_contrast_margin: float = 0.0
-    action_contrast_horizon: int = 1
     batch_size: int = 64
     train_steps: int = 10000
     num_workers: int = 2
@@ -695,15 +691,44 @@ class StaticWindowDataset(torch.utils.data.Dataset):
         self.window_pixels = history_size + max(num_preds, rollout_steps)
         self.window_actions = self.window_pixels - 1
         self.episodes: list[dict[str, np.ndarray]] = []
-        for path in sorted(dataset_dir.glob("episode_*.npz")):
-            with np.load(path) as ep:
-                episode = {key: ep[key].copy() for key in ep.files}
-                episode["__path__"] = np.asarray(str(path))
-            pixels = episode["pixels"]
-            actions = episode["actions"].astype(np.float32)
+
+        def _add(name: str, pixels: np.ndarray, actions: np.ndarray, extras: dict) -> None:
+            actions = actions.astype(np.float32)
             if len(pixels) >= self.window_pixels and len(actions) >= self.window_actions:
-                episode["actions"] = actions
-                self.episodes.append(episode)
+                ep = {"pixels": pixels, "actions": actions, "__path__": np.asarray(name)}
+                ep.update(extras)
+                self.episodes.append(ep)
+
+        # Goal demo (single trajectory).
+        goal_path = dataset_dir / "goal_trajectory.npz"
+        if goal_path.exists():
+            with np.load(goal_path) as g:
+                _add(
+                    str(goal_path),
+                    g["pixels"].copy(),
+                    g["actions"].copy(),
+                    {k: g[k].copy() for k in g.files if k not in ("pixels", "actions")},
+                )
+
+        # Perturbed batch (N episodes stacked).
+        perturbed_path = dataset_dir / "perturbed.npz"
+        if perturbed_path.exists():
+            with np.load(perturbed_path) as p:
+                pixels_batch = p["pixels"]   # (N, T+1, H, W, 3)
+                actions_batch = p["actions"] # (N, T, A)
+                # Per-step task metrics stack as (N, T, ...).
+                per_episode_keys = [k for k in p.files
+                                    if k not in ("pixels", "actions", "metadata")
+                                    and p[k].ndim >= 1
+                                    and p[k].shape[0] == pixels_batch.shape[0]]
+                for i in range(pixels_batch.shape[0]):
+                    extras = {k: p[k][i].copy() for k in per_episode_keys}
+                    _add(
+                        f"{perturbed_path}#{i:04d}",
+                        pixels_batch[i].copy(),
+                        actions_batch[i].copy(),
+                        extras,
+                    )
 
         self.index: list[tuple[int, int]] = []
         weights: list[float] = []
@@ -850,7 +875,7 @@ def lewm_loss(
         and rollout_target is not None
         and actions.size(0) > 1
     ):
-        ach = min(cfg.action_contrast_horizon, rollout_pred.size(1))
+        ach = min(8, rollout_pred.size(1))
         if ach > 0:
             # Shuffle the future-action sequence across the batch dimension to
             # produce a "wrong action" matched to each visual history.
@@ -875,13 +900,11 @@ def lewm_loss(
             # Per-sample, per-step MSE to the ground-truth latent target.
             true_err = (rollout_pred[:, :ach] - rollout_target[:, :ach]).pow(2).mean(dim=-1)
             wrong_err = (wrong_pred[:, :ach] - rollout_target[:, :ach]).pow(2).mean(dim=-1)
-            margin = cfg.action_contrast_margin
-            # log(1 + exp(x)) with x = (true + margin - wrong) / scale.
+            # log(1 + exp(x)) with x = (true - wrong) / scale.
             # Use the mean wrong-action MSE as a per-batch scale so the loss
             # stays in O(1) regardless of where the predictor is in training.
             scale = wrong_err.detach().mean().clamp_min(1e-6)
-            x = (true_err + margin - wrong_err) / scale
-            contrast_loss = torch.nn.functional.softplus(x).mean()
+            contrast_loss = torch.nn.functional.softplus((true_err - wrong_err) / scale).mean()
             contrast_margin_violation = (true_err - wrong_err).mean().detach()
 
     sigreg_loss = sigreg(emb.transpose(0, 1))
@@ -1035,16 +1058,16 @@ def train_lewm(
                     )
             if train_cfg.checkpoint_every > 0 and step % train_cfg.checkpoint_every == 0:
                 latest_path = ckpt_path.with_name("lewm_latest.pt")
+                step_path = ckpt_path.with_name(f"lewm_step{step:06d}.pt")
                 latest_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    {
-                        "state_dict": model.state_dict(),
-                        "action_dim": model_cfg.action_dim,
-                        "config": hparams,
-                        "step": step,
-                    },
-                    latest_path,
-                )
+                payload = {
+                    "state_dict": model.state_dict(),
+                    "action_dim": model_cfg.action_dim,
+                    "config": hparams,
+                    "step": step,
+                }
+                torch.save(payload, latest_path)
+                torch.save(payload, step_path)
     pbar.close()
 
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)

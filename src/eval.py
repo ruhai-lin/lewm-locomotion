@@ -18,8 +18,7 @@ The eval loop:
 Nothing in this file mentions walker / cheetah / hopper. Tasks plug in via
 callables: ``env_fn``, ``render_video_fn``, ``render_dataset_fn``,
 ``action_bounds_fn``, ``record_fn``, ``preprocess_pixels_fn``,
-``encode_frames_fn``, and ``goal_frame_mask_fn`` / ``fall_frame_mask_fn``
-for manifold building.
+and ``encode_frames_fn`` for manifold building.
 """
 
 from __future__ import annotations
@@ -60,15 +59,9 @@ class EvalConfig:
     min_std: float
     max_std: float
     momentum: float
-    warm_start_blend: float = 0.0
-    prior_tie_rel: float = 0.0
     prior_tie_abs: float = 0.0
     prior_in_mean: bool = True
     prior_in_samples: bool = True
-    state_cost_clip: float = 0.0
-    delta_cost_clip: float = 0.0
-    near_cost_clip: float = 0.0
-    near_delta_weight: float = 0.0
     cost_scale_min: float = 1e-4
     traj_discount: float = 0.92
     video_fps: int = 40
@@ -114,6 +107,15 @@ def _nearest_goal_phase(
     return idx, float(dist[idx].item())
 
 
+@torch.no_grad()
+def _nearest_point_mse(point: torch.Tensor, points: torch.Tensor) -> float:
+    if points.size(0) == 0:
+        return float("nan")
+    point = point.view(1, -1).float()
+    dist = (points.float() - point).pow(2).mean(dim=-1)
+    return float(dist.min().item())
+
+
 # ---------------------------------------------------------------------------
 # Main entrypoint.
 # ---------------------------------------------------------------------------
@@ -138,9 +140,6 @@ def evaluate_lewm_cem(
     render_video_fn: Callable[[object], np.ndarray],
     record_fn: Callable[[object], dict[str, float]],
     preprocess_pixels_fn: PreprocessPixelsFn,
-    goal_frame_mask_fn: Callable[[dict[str, np.ndarray]], np.ndarray],
-    fall_frame_mask_fn: Callable[[dict[str, np.ndarray]], np.ndarray] | None = None,
-    manifold_min_mask_frames: int = 17,
     manifold_max_points: int = 4096,
     manifold_max_segments: int = 4096,
     extra_metrics: dict | None = None,
@@ -167,13 +166,9 @@ def evaluate_lewm_cem(
         )
 
     goal_manifold = build_goal_manifold(
-        dataset_dir=dataset_dir,
         goal_pixels=goal_pixels,
         encode_frames=_encode,
-        goal_frame_mask_fn=goal_frame_mask_fn,
-        fall_frame_mask_fn=fall_frame_mask_fn,
         plan_horizon=eval_cfg.plan_horizon,
-        min_mask_frames=manifold_min_mask_frames,
         max_state_points=manifold_max_points,
         max_delta_points=manifold_max_points,
         max_segments=manifold_max_segments,
@@ -209,6 +204,7 @@ def evaluate_lewm_cem(
     initial_frame = render_dataset_fn(env)
     history_frames: list[np.ndarray] = [initial_frame.copy()]
     history_actions: list[np.ndarray] = [zero.copy()]
+    last_obs_latent = _encode(initial_frame[None])[0]
     previous_action = torch.zeros(action_dim, device=device)
     horizon_weights = torch.tensor(
         [eval_cfg.traj_discount**i for i in range(eval_cfg.plan_horizon)],
@@ -231,16 +227,10 @@ def evaluate_lewm_cem(
             max_std=eval_cfg.max_std,
             min_std=eval_cfg.min_std,
             momentum=eval_cfg.momentum,
-            warm_start_blend=eval_cfg.warm_start_blend,
-            prior_tie_rel=eval_cfg.prior_tie_rel,
             prior_tie_abs=eval_cfg.prior_tie_abs,
             cost_scale_min=eval_cfg.cost_scale_min,
-            near_delta_weight=eval_cfg.near_delta_weight,
             prior_in_mean=eval_cfg.prior_in_mean,
             prior_in_samples=eval_cfg.prior_in_samples,
-            state_cost_clip=eval_cfg.state_cost_clip,
-            delta_cost_clip=eval_cfg.delta_cost_clip,
-            near_cost_clip=eval_cfg.near_cost_clip,
         ),
         weights,
     )
@@ -249,12 +239,46 @@ def evaluate_lewm_cem(
     rewards: list[float] = []
     actions_out: list[np.ndarray] = []
     diag_log: dict[str, list[float]] = {}
+    tracking_log: dict[str, list[float]] = {}
     cost_infos: list[dict[str, float]] = []
 
     phase = 0
     env_steps = 0
-    warm_start_blocks: torch.Tensor | None = None
     bar = tqdm(total=eval_cfg.eval_steps, desc="eval LeWM-CEM", dynamic_ncols=True)
+
+    def _tracking_record(
+        *,
+        next_frame: np.ndarray,
+        prev_latent: torch.Tensor,
+        phase_value: int,
+        selected_action: np.ndarray,
+        prior_action: np.ndarray,
+    ) -> tuple[dict[str, float], torch.Tensor]:
+        next_latent = _encode(next_frame[None])[0]
+        obs_delta = next_latent - prev_latent
+        goal_idx = _frame_index(phase_value, goal_latents.size(0))
+        goal_latent = goal_latents[goal_idx]
+        action_diff = selected_action.astype(np.float32) - prior_action.astype(np.float32)
+        state_mse = _nearest_point_mse(next_latent, goal_manifold.state_latents)
+        delta_mse = _nearest_point_mse(obs_delta, goal_manifold.delta_latents)
+        nearest_goal_mse = _nearest_point_mse(next_latent, goal_latents)
+        phase_goal_mse = float((next_latent.float() - goal_latent.float()).pow(2).mean().item())
+        record = {
+            "obs_state_mse": state_mse,
+            "obs_delta_mse": delta_mse,
+            "obs_state_dist_norm": state_mse / max(goal_manifold.state_scale, 1e-8),
+            "obs_delta_dist_norm": delta_mse / max(goal_manifold.delta_scale, 1e-8),
+            "obs_goal_traj_mse": nearest_goal_mse,
+            "obs_goal_traj_dist_norm": nearest_goal_mse / max(goal_manifold.state_scale, 1e-8),
+            "obs_phase_goal_mse": phase_goal_mse,
+            "obs_phase_goal_dist_norm": phase_goal_mse / max(goal_manifold.state_scale, 1e-8),
+            "selected_prior_action_l2": float(np.linalg.norm(action_diff)),
+            "selected_prior_action_mse": float(np.mean(action_diff * action_diff)),
+            "selected_prior_action_mean_abs": float(np.mean(np.abs(action_diff))),
+        }
+        for key, value in record.items():
+            tracking_log.setdefault(key, []).append(float(value))
+        return record, next_latent
 
     bootstrap_steps = min(eval_cfg.bootstrap_steps, eval_cfg.eval_steps, len(goal_actions_np))
     for boot in range(bootstrap_steps):
@@ -266,7 +290,15 @@ def evaluate_lewm_cem(
         actions_out.append(action.copy())
         for key, value in diag.items():
             diag_log.setdefault(key, []).append(float(value))
-        history_frames.append(render_dataset_fn(env))
+        next_frame = render_dataset_fn(env)
+        tracking, last_obs_latent = _tracking_record(
+            next_frame=next_frame,
+            prev_latent=last_obs_latent,
+            phase_value=boot + 1,
+            selected_action=action,
+            prior_action=action,
+        )
+        history_frames.append(next_frame)
         history_actions.append(action.copy())
         previous_action = torch.from_numpy(action).to(device)
         env_steps += 1
@@ -280,6 +312,7 @@ def evaluate_lewm_cem(
                 "return": float(np.sum(rewards)),
                 "phase": boot,
                 "action_abs": float(np.mean(np.abs(action))),
+                **tracking,
                 **{k: float(v) for k, v in diag.items()},
             }
         )
@@ -325,9 +358,7 @@ def evaluate_lewm_cem(
             high=high,
             horizon_weights=horizon_weights,
             rng=rng,
-            warm_start_blocks=warm_start_blocks,
         )
-        warm_start_blocks = torch.cat([plan[1:], plan[-1:]], dim=0).detach()
 
         action = plan[0].detach().cpu().numpy().astype(np.float32)
         for _ in range(eval_cfg.action_block):
@@ -342,7 +373,22 @@ def evaluate_lewm_cem(
             for key, value in diag.items():
                 diag_log.setdefault(key, []).append(float(value))
             cost_infos.append(plan_info)
-            history_frames.append(render_dataset_fn(env))
+            next_frame = render_dataset_fn(env)
+            prior_step_action = (
+                goal_actions[_action_index(step_phase, goal_actions.size(0))]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+            tracking, last_obs_latent = _tracking_record(
+                next_frame=next_frame,
+                prev_latent=last_obs_latent,
+                phase_value=step_phase + 1,
+                selected_action=action,
+                prior_action=prior_step_action,
+            )
+            history_frames.append(next_frame)
             history_actions.append(action.copy())
             previous_action = torch.from_numpy(action).to(device)
             env_steps += 1
@@ -358,6 +404,7 @@ def evaluate_lewm_cem(
                     "global_phase": int(global_phase),
                     "action_abs": float(np.mean(np.abs(action))),
                     "previous_action_abs": float(previous_action.abs().mean().detach().cpu()),
+                    **tracking,
                     **{k: float(v) for k, v in diag.items()},
                     **plan_info,
                 }
@@ -365,8 +412,6 @@ def evaluate_lewm_cem(
             method_share = (
                 plan_info.get("state_cost_share", 0.0)
                 + plan_info.get("delta_cost_share", 0.0)
-                + plan_info.get("support_state_cost_share", 0.0)
-                + plan_info.get("support_delta_cost_share", 0.0)
             )
             postfix = {
                 "ret": f"{sum(rewards):.1f}",
@@ -391,12 +436,7 @@ def evaluate_lewm_cem(
             return float("nan")
         return float(np.mean([info.get(key, 0.0) for info in cost_infos]))
 
-    mean_state_delta_share = mean_cost_info("state_cost_share") + mean_cost_info("delta_cost_share")
-    mean_support_share = (
-        mean_cost_info("support_state_cost_share")
-        + mean_cost_info("support_delta_cost_share")
-    )
-    mean_method_share = mean_state_delta_share + mean_support_share
+    mean_method_share = mean_cost_info("state_cost_share") + mean_cost_info("delta_cost_share")
     mean_near_prior_share = mean_cost_info("near_cost_share") + mean_cost_info("prior_cost_share")
     total_return = float(np.sum(rewards)) if rewards else 0.0
     metrics = {
@@ -410,8 +450,6 @@ def evaluate_lewm_cem(
         "planner_weights": weights.as_dict(),
         "mean_state_cost": mean_cost_info("state_cost"),
         "mean_delta_cost": mean_cost_info("delta_cost"),
-        "mean_support_state_cost": mean_cost_info("support_state_cost"),
-        "mean_support_delta_cost": mean_cost_info("support_delta_cost"),
         "mean_near_cost": mean_cost_info("near_cost"),
         "mean_prior_cost": mean_cost_info("prior_cost"),
         "mean_smooth_cost": mean_cost_info("smooth_cost"),
@@ -419,18 +457,13 @@ def evaluate_lewm_cem(
         "mean_total_cost": mean_cost_info("total_cost"),
         "mean_state_cost_share": mean_cost_info("state_cost_share"),
         "mean_delta_cost_share": mean_cost_info("delta_cost_share"),
-        "mean_support_state_cost_share": mean_cost_info("support_state_cost_share"),
-        "mean_support_delta_cost_share": mean_cost_info("support_delta_cost_share"),
         "mean_near_cost_share": mean_cost_info("near_cost_share"),
         "mean_prior_cost_share": mean_cost_info("prior_cost_share"),
         "prior_guard_used_rate": mean_cost_info("used_prior_guard"),
         "mean_prior_cost_improvement": mean_cost_info("prior_cost_improvement"),
         "mean_prior_guard_margin": mean_cost_info("prior_guard_margin"),
-        "mean_state_delta_cost_share": mean_state_delta_share,
-        "mean_support_cost_share": mean_support_share,
         "mean_method_cost_share": mean_method_share,
         "mean_near_prior_cost_share": mean_near_prior_share,
-        "state_delta_dominant": bool(mean_state_delta_share > mean_near_prior_share),
         "method_cost_dominant": bool(mean_method_share > mean_near_prior_share),
         "sanity_return_ok": bool(total_return >= 100.0),
         "goal_manifold": {
@@ -440,14 +473,8 @@ def evaluate_lewm_cem(
                 "delta_points",
                 "state_segments",
                 "delta_segments",
-                "support_state_points",
-                "support_delta_points",
-                "support_state_segments",
-                "support_delta_segments",
                 "state_scale",
                 "delta_scale",
-                "support_state_scale",
-                "support_delta_scale",
             )
         },
         "checkpoint": str(ckpt_path),
@@ -461,6 +488,11 @@ def evaluate_lewm_cem(
     # by ``record_fn``. We use ``mean_<key>`` naming so existing dashboards
     # that look for ``mean_torso_height`` keep working on walker.
     for key, values in diag_log.items():
+        if values:
+            metrics[f"mean_{key}"] = float(np.nanmean(values))
+            metrics[f"min_{key}"] = float(np.nanmin(values))
+            metrics[f"max_{key}"] = float(np.nanmax(values))
+    for key, values in tracking_log.items():
         if values:
             metrics[f"mean_{key}"] = float(np.nanmean(values))
             metrics[f"min_{key}"] = float(np.nanmin(values))

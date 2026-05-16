@@ -31,14 +31,14 @@ outputs/walker_walk/
 ├── train_log.jsonl      # per-step training metrics
 ├── eval_trace.jsonl     # per-step eval metrics + CEM cost breakdown
 ├── eval_cam.mp4         # eval video
-├── goal_trajectory.mp4  # the oracle (or best-explore) goal demo
+├── goal_trajectory.mp4  # the SAC (or best-explore) goal demo
 ├── metrics.json         # summary stats
 └── diagnostics.json     # goal manifold sizes/scales + planner weights
 ```
 
 The dataset itself is at ``datasets/<task_name>/`` with the same schema for
 all three tasks: ``episode_NNNN.npz`` files (pixels, actions, rewards, plus
-task-specific per-step metrics), ``goal_trajectory.npz`` (the oracle demo),
+task-specific per-step metrics), ``goal_trajectory.npz`` (the SAC demo),
 ``goal_manifold.mp4`` (post-hoc sweep of "looks like the goal" frames across
 the whole dataset, for sanity-checking), and ``metadata.json``.
 
@@ -47,7 +47,7 @@ the whole dataset, for sanity-checking), and ``metadata.json``.
 ```text
 src/
 ├── datasets.py    # exploration policies + parallel data collection +
-│                  # goal-manifold rendering + oracle CEM goal demo
+│                  # goal-manifold rendering + SAC goal demo (SB3)
 ├── lewm.py        # SIGReg/JEPA/ARPredictor + training + rollout
 ├── manifold.py    # latent state/delta manifold construction +
 │                  # build_goal_manifold helper
@@ -60,16 +60,16 @@ tasks/
 └── cheetah_run.py    # same shape, cheetah-specific bits
 ```
 
-A task adapter is fully described by **four callables and a constants block**:
+A task adapter is fully described by **three callables and a constants block**:
 
 - ``make_env(seed)``, ``render_dataset_frame(env)``, ``render_video_frame(env)``,
   ``diagnostics(env)`` — env wiring.
-- ``goal_frame_mask(episode)``, ``fall_frame_mask(episode)`` — post-hoc
-  frame labelling for the goal/support manifold.
-- ``oracle_score_fn(oracle_env, state0, actions, prev_action)`` — task reward
-  shaping used **only** during the oracle demo (the 128 explore episodes
-  never see this).
-- The ``ORACLE_*`` and ``CEM_*`` constants and the goal/support thresholds.
+- ``goal_frame_mask(episode)`` — post-hoc frame labelling for the goal manifold.
+- The ``CEM_*`` and goal-threshold constants.
+
+The goal demo is produced by ``datasets.collect_sac_goal_demo`` (a thin
+SB3 SAC wrapper, ``SAC_TIMESTEPS`` of dm_control-state training); no
+task-specific score function is needed.
 
 
 If you find this code useful, please cite the following source:

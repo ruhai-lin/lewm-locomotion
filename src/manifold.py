@@ -1,7 +1,10 @@
 """Generic latent state/delta manifold construction.
 
-Task adapters decide which frames belong to successful behavior. This module
-only consumes masks over pixels and builds latent geometry for planning.
+Builds the latent state + delta geometry that the CEM planner uses as its
+target. Currently the goal manifold is built from a single SAC reference
+trajectory; the per-frame-mask plumbing for stitching arbitrary segments
+still lives here and is used by ``build_latent_manifold`` if a caller
+ever wants to pass in multiple ``SuccessSegment``s.
 """
 
 from __future__ import annotations
@@ -31,7 +34,6 @@ class SuccessSegment:
     name: str
     pixels: np.ndarray
     mask: np.ndarray
-    role: str = "goal"
     metadata: dict | None = None
 
 
@@ -41,14 +43,8 @@ class LatentManifold:
     delta_latents: torch.Tensor
     state_segments: torch.Tensor
     delta_segments: torch.Tensor
-    support_state_latents: torch.Tensor
-    support_delta_latents: torch.Tensor
-    support_state_segments: torch.Tensor
-    support_delta_segments: torch.Tensor
     state_scale: float
     delta_scale: float
-    support_state_scale: float
-    support_delta_scale: float
     diagnostics: dict
 
 
@@ -106,22 +102,6 @@ def contiguous_motion_segments(
     return torch.stack(state_segments, dim=0), torch.stack(delta_segments, dim=0)
 
 
-def _empty_like(parts: list[torch.Tensor], horizon: int, device: torch.device) -> torch.Tensor:
-    if parts:
-        dim = parts[0].size(-1)
-    else:
-        dim = 1
-    return torch.zeros((0, horizon, dim), device=device)
-
-
-def _empty_points_like(parts: list[torch.Tensor], device: torch.device) -> torch.Tensor:
-    if parts:
-        dim = parts[0].size(-1)
-    else:
-        dim = 1
-    return torch.zeros((0, dim), device=device)
-
-
 def _robust_scale(values: torch.Tensor, min_value: float, max_points: int) -> tuple[float, dict]:
     stats = nearest_neighbor_mse_stats(values, max_points)
     if not stats:
@@ -136,19 +116,13 @@ def build_latent_manifold(
     config: ManifoldConfig,
     device: torch.device,
 ) -> LatentManifold:
-    goal_state_parts: list[torch.Tensor] = []
-    goal_delta_parts: list[torch.Tensor] = []
-    goal_state_segment_parts: list[torch.Tensor] = []
-    goal_delta_segment_parts: list[torch.Tensor] = []
-    support_state_parts: list[torch.Tensor] = []
-    support_delta_parts: list[torch.Tensor] = []
-    support_state_segment_parts: list[torch.Tensor] = []
-    support_delta_segment_parts: list[torch.Tensor] = []
+    state_parts: list[torch.Tensor] = []
+    delta_parts: list[torch.Tensor] = []
+    state_segment_parts: list[torch.Tensor] = []
+    delta_segment_parts: list[torch.Tensor] = []
     sources: list[dict] = []
 
     for source in segments:
-        if source.role not in {"goal", "support"}:
-            raise ValueError(f"unknown success segment role: {source.role}")
         latents = encode_frames(source.pixels).float()
         mask_np = np.asarray(source.mask, dtype=bool)
         if len(mask_np) != len(source.pixels):
@@ -158,187 +132,85 @@ def build_latent_manifold(
 
         states = latents[mask]
         deltas = latents[1:][pair_mask] - latents[:-1][pair_mask]
-        state_segments, delta_segments = contiguous_motion_segments(latents, mask, config.horizon)
-
-        if source.role == "goal":
-            state_parts = goal_state_parts
-            delta_parts = goal_delta_parts
-            state_segment_parts = goal_state_segment_parts
-            delta_segment_parts = goal_delta_segment_parts
-        else:
-            state_parts = support_state_parts
-            delta_parts = support_delta_parts
-            state_segment_parts = support_state_segment_parts
-            delta_segment_parts = support_delta_segment_parts
+        seg_states, seg_deltas = contiguous_motion_segments(latents, mask, config.horizon)
 
         if states.numel() > 0:
             state_parts.append(states)
         if deltas.numel() > 0:
             delta_parts.append(deltas)
-        if state_segments.numel() > 0:
-            state_segment_parts.append(state_segments)
-        if delta_segments.numel() > 0:
-            delta_segment_parts.append(delta_segments)
+        if seg_states.numel() > 0:
+            state_segment_parts.append(seg_states)
+        if seg_deltas.numel() > 0:
+            delta_segment_parts.append(seg_deltas)
 
-        sources.append(
-            {
-                "name": source.name,
-                "role": source.role,
-                "frames": int(len(source.pixels)),
-                "state_points": int(states.size(0)),
-                "delta_points": int(deltas.size(0)),
-                "state_segments": int(state_segments.size(0)),
-                "delta_segments": int(delta_segments.size(0)),
-                "metadata": source.metadata or {},
-            }
-        )
+        sources.append({
+            "name": source.name,
+            "frames": int(len(source.pixels)),
+            "state_points": int(states.size(0)),
+            "delta_points": int(deltas.size(0)),
+            "state_segments": int(seg_states.size(0)),
+            "delta_segments": int(seg_deltas.size(0)),
+            "metadata": source.metadata or {},
+        })
 
-    if not goal_state_parts or not goal_delta_parts or not goal_state_segment_parts:
+    if not state_parts or not delta_parts or not state_segment_parts:
         raise RuntimeError("Could not build a non-empty goal latent manifold.")
 
-    state_latents = subsample_rows(torch.cat(goal_state_parts, dim=0), config.max_state_points)
-    delta_latents = subsample_rows(torch.cat(goal_delta_parts, dim=0), config.max_delta_points)
-    state_segments = subsample_rows(torch.cat(goal_state_segment_parts, dim=0), config.max_segments)
-    delta_segments = subsample_rows(torch.cat(goal_delta_segment_parts, dim=0), config.max_segments)
-
-    support_state_latents = (
-        subsample_rows(torch.cat(support_state_parts, dim=0), config.max_state_points)
-        if support_state_parts else _empty_points_like(goal_state_parts, device)
-    )
-    support_delta_latents = (
-        subsample_rows(torch.cat(support_delta_parts, dim=0), config.max_delta_points)
-        if support_delta_parts else _empty_points_like(goal_delta_parts, device)
-    )
-    support_state_segments = (
-        subsample_rows(torch.cat(support_state_segment_parts, dim=0), config.max_segments)
-        if support_state_segment_parts else _empty_like(goal_state_parts, config.horizon, device)
-    )
-    support_delta_segments = (
-        subsample_rows(torch.cat(support_delta_segment_parts, dim=0), config.max_segments)
-        if support_delta_segment_parts else _empty_like(goal_delta_parts, config.horizon, device)
-    )
+    state_latents = subsample_rows(torch.cat(state_parts, dim=0), config.max_state_points)
+    delta_latents = subsample_rows(torch.cat(delta_parts, dim=0), config.max_delta_points)
+    state_segments = subsample_rows(torch.cat(state_segment_parts, dim=0), config.max_segments)
+    delta_segments = subsample_rows(torch.cat(delta_segment_parts, dim=0), config.max_segments)
 
     state_scale, state_nn = _robust_scale(state_latents, config.cost_scale_min, config.nn_stats_points)
     delta_scale, delta_nn = _robust_scale(delta_latents, config.cost_scale_min, config.nn_stats_points)
-    support_state_scale, support_state_nn = (
-        _robust_scale(support_state_latents, config.cost_scale_min, config.nn_stats_points)
-        if support_state_latents.size(0) >= 2 else (state_scale, {})
-    )
-    support_delta_scale, support_delta_nn = (
-        _robust_scale(support_delta_latents, config.cost_scale_min, config.nn_stats_points)
-        if support_delta_latents.size(0) >= 2 else (delta_scale, {})
-    )
 
-    delta_norm = delta_latents.pow(2).mean(dim=-1)
-    support_delta_norm = (
-        support_delta_latents.pow(2).mean(dim=-1)
-        if support_delta_latents.size(0) else torch.zeros(0, device=device)
-    )
     diagnostics = {
         "sources": sources,
         "state_points": int(state_latents.size(0)),
         "delta_points": int(delta_latents.size(0)),
         "state_segments": int(state_segments.size(0)),
         "delta_segments": int(delta_segments.size(0)),
-        "support_state_points": int(support_state_latents.size(0)),
-        "support_delta_points": int(support_delta_latents.size(0)),
-        "support_state_segments": int(support_state_segments.size(0)),
-        "support_delta_segments": int(support_delta_segments.size(0)),
         "state_scale": state_scale,
         "delta_scale": delta_scale,
-        "support_state_scale": support_state_scale,
-        "support_delta_scale": support_delta_scale,
         "state_nearest_mse": state_nn,
         "delta_nearest_mse": delta_nn,
-        "support_state_nearest_mse": support_state_nn,
-        "support_delta_nearest_mse": support_delta_nn,
-        "delta_norm_mse": tensor_stats(delta_norm),
-        "support_delta_norm_mse": tensor_stats(support_delta_norm),
+        "delta_norm_mse": tensor_stats(delta_latents.pow(2).mean(dim=-1)),
     }
     return LatentManifold(
         state_latents=state_latents,
         delta_latents=delta_latents,
         state_segments=state_segments,
         delta_segments=delta_segments,
-        support_state_latents=support_state_latents,
-        support_delta_latents=support_delta_latents,
-        support_state_segments=support_state_segments,
-        support_delta_segments=support_delta_segments,
         state_scale=state_scale,
         delta_scale=delta_scale,
-        support_state_scale=support_state_scale,
-        support_delta_scale=support_delta_scale,
         diagnostics=diagnostics,
     )
-
-
-
-# ---------------------------------------------------------------------------
-# High-level goal manifold builder (used by eval).
-# Task adapters provide ``goal_frame_mask_fn`` / ``fall_frame_mask_fn`` to
-# decide which frames in the dataset are "goal" vs "off-manifold support".
-# ---------------------------------------------------------------------------
-
-
-FrameMaskFn = Callable[[dict[str, np.ndarray]], np.ndarray]
 
 
 @torch.no_grad()
 def build_goal_manifold(
     *,
-    dataset_dir,
     goal_pixels: np.ndarray,
     encode_frames: EncodeFramesFn,
-    goal_frame_mask_fn: FrameMaskFn,
-    fall_frame_mask_fn: FrameMaskFn | None,
     plan_horizon: int,
-    min_mask_frames: int,
     max_state_points: int = 4096,
     max_delta_points: int = 4096,
     max_segments: int = 4096,
     cost_scale_min: float = 1e-4,
     device: torch.device | None = None,
 ) -> LatentManifold:
-    """Build the goal/support latent manifold from a dataset directory.
+    """Build the goal latent manifold from a single goal trajectory.
 
-    - The explicit ``goal_pixels`` trajectory becomes the canonical goal
-      segment (full mask).
-    - Every ``episode_*.npz`` in ``dataset_dir`` contributes goal frames
-      where ``goal_frame_mask_fn(ep)`` is True and support (off-manifold)
-      frames where ``fall_frame_mask_fn(ep)`` is True (if provided).
+    The whole ``goal_pixels`` trajectory contributes (mask is all True).
+    No per-episode stitching — the manifold tracks one SAC reference
+    rollout so CEM has a clean, unambiguous target.
     """
-    from pathlib import Path as _Path  # local import to avoid top-level clutter
-
-    dataset_dir = _Path(dataset_dir)
-    segments: list[SuccessSegment] = []
-
-    def _add(name: str, pixels: np.ndarray, role: str, mask: np.ndarray) -> None:
-        if int(mask.sum()) < min_mask_frames:
-            return
-        segments.append(
-            SuccessSegment(
-                name=name,
-                pixels=pixels.copy(),
-                mask=mask.astype(bool),
-                role=role,
-                metadata={"source": name},
-            )
-        )
-
-    _add(
-        "goal_trajectory",
-        goal_pixels,
-        "goal",
-        np.ones(len(goal_pixels), dtype=bool),
-    )
-    for path in sorted(dataset_dir.glob("episode_*.npz")):
-        with np.load(path) as ep_npz:
-            ep = {k: ep_npz[k] for k in ep_npz.files}
-        pixels = ep["pixels"]
-        _add(path.name + ":goal", pixels, "goal", goal_frame_mask_fn(ep))
-        if fall_frame_mask_fn is not None:
-            _add(path.name + ":fall", pixels, "support", fall_frame_mask_fn(ep))
-
+    segments = [SuccessSegment(
+        name="goal_trajectory",
+        pixels=goal_pixels.copy(),
+        mask=np.ones(len(goal_pixels), dtype=bool),
+        metadata={"source": "goal_trajectory"},
+    )]
     return build_latent_manifold(
         segments,
         encode_frames=encode_frames,

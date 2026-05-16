@@ -1,10 +1,15 @@
 .venv/
 __pycache__/
+ablation/
 outputs/
 references/
 legacy/
 datasets/
 scripts/
+paper/
 
 experiments.md
 src/diagnostics/
+
+AGENTS.md
+CLAUDE.md

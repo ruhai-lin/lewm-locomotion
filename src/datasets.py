@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
+import gymnasium
 import imageio.v2 as imageio
 import numpy as np
 
@@ -466,284 +467,202 @@ def collect_dataset(
 
 
 # ---------------------------------------------------------------------------
-# Goal-manifold rendering (post-hoc goal-frame selection + mp4 + json log).
+# SAC-driven dataset producer.
 #
-# The collection loop is policy-agnostic; the goal manifold is whatever frames
-# the task adapter labels as "goal" via a ``goal_mask_fn``. Rendering the
-# resulting frame set as a video makes it easy to eyeball whether the
-# automatic selection produced anything resembling the desired behaviour.
+# Trains (or loads from cache) a stable-baselines3 SAC policy on the
+# dm_control task using the low-dimensional physics state as observation,
+# then rolls N episodes with three perturbation recipes (stable /
+# action_noise / warmup_random) to produce a visual replay dataset that
+# covers stable-walking, mid-rollout recovery, and atypical-start recovery
+# in the same .npz schema as the (deleted) random-explore episodes.
+# The trained policy is cached at ``out_dir/sac/policy.zip`` so that tuning
+# perturbation knobs doesn't require retraining.
 # ---------------------------------------------------------------------------
 
 
-GoalMaskFn = Callable[[dict[str, np.ndarray]], np.ndarray]
+class _DmcGymEnv(gymnasium.Env):
+    """Minimal Gymnasium env wrapping a dm_control suite.Env.
 
-
-@dataclass(frozen=True)
-class GoalManifoldStats:
-    total_frames: int
-    total_segments: int
-    episodes_contributing: int
-    per_episode: list[dict]
-    metrics_summary: dict[str, dict[str, float]]
-
-
-def _goal_contiguous_segments(mask: np.ndarray, min_len: int = 1) -> list[tuple[int, int]]:
-    """Return a list of ``(start, end_exclusive)`` for True runs of length >= min_len."""
-    mask = np.asarray(mask, dtype=bool)
-    if mask.size == 0:
-        return []
-    diff = np.diff(mask.astype(np.int8), prepend=0, append=0)
-    starts = np.where(diff == 1)[0]
-    ends = np.where(diff == -1)[0]
-    out = []
-    for s, e in zip(starts, ends):
-        if e - s >= min_len:
-            out.append((int(s), int(e)))
-    return out
-
-
-def render_goal_manifold(
-    *,
-    dataset_dir: Path,
-    out_dir: Path,
-    goal_mask_fn: GoalMaskFn,
-    video_fps: int = 30,
-    min_segment_len: int = 1,
-    metric_keys: tuple[str, ...] = ("torso_height", "torso_upright", "horizontal_velocity", "rewards"),
-) -> GoalManifoldStats:
-    """Write ``goal_manifold.mp4`` and ``goal_manifold_log.json`` summarising
-    every contiguous "goal" segment across the dataset. The mp4 is rendered
-    at the dataset's native pixel resolution.
+    Observation = concatenated qpos + qvel. Reward = the task's env reward.
+    SB3 expects ``reset(seed=...) -> (obs, info)`` and
+    ``step(action) -> (obs, reward, terminated, truncated, info)``.
     """
-    dataset_dir = Path(dataset_dir)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    paths = sorted(dataset_dir.glob("episode_*.npz"))
-    if not paths:
-        raise RuntimeError(f"no episodes in {dataset_dir}")
 
-    log_episodes: list[dict] = []
-    metrics_accum: dict[str, list[float]] = {}
-    total_frames = 0
-    total_segments = 0
-    episodes_contributing = 0
+    metadata: dict = {"render_modes": []}
 
-    video_path = out_dir / "goal_manifold.mp4"
-    log_path = out_dir / "goal_manifold_log.json"
-    writer = imageio.get_writer(video_path, fps=video_fps, codec="libx264", quality=8)
-    try:
-        for path in paths:
-            with np.load(path) as ep_npz:
-                ep = {k: ep_npz[k] for k in ep_npz.files}
-            mask = goal_mask_fn(ep).astype(bool)
-            segments = _goal_contiguous_segments(mask, min_len=min_segment_len)
-            if not segments:
-                continue
-            episodes_contributing += 1
-            ep_log = {
-                "path": str(path),
-                "segments": [],
-                "total_goal_frames": int(mask.sum()),
-            }
-            for seg_start, seg_end in segments:
-                seg_pixels = ep["pixels"][seg_start:seg_end]
-                for frame in seg_pixels:
-                    writer.append_data(frame)
-                seg_log = {
-                    "start": seg_start,
-                    "end": seg_end,
-                    "length": seg_end - seg_start,
-                }
-                for key in metric_keys:
-                    if key in ep:
-                        arr = np.asarray(ep[key])
-                        m_start = min(seg_start, len(arr))
-                        m_end = min(seg_end, len(arr))
-                        if m_end > m_start:
-                            slice_ = arr[m_start:m_end]
-                            seg_log[f"{key}_mean"] = float(slice_.mean())
-                            seg_log[f"{key}_min"] = float(slice_.min())
-                            seg_log[f"{key}_max"] = float(slice_.max())
-                            metrics_accum.setdefault(key, []).extend(slice_.tolist())
-                total_frames += seg_end - seg_start
-                total_segments += 1
-                ep_log["segments"].append(seg_log)
-            log_episodes.append(ep_log)
-    finally:
-        writer.close()
+    def __init__(self, env_fn, seed: int, episode_steps: int):
+        super().__init__()
+        self._env = env_fn(seed)
+        self._env.reset()
+        low, high = (
+            np.asarray(self._env.action_spec().minimum, dtype=np.float32),
+            np.asarray(self._env.action_spec().maximum, dtype=np.float32),
+        )
+        self.action_space = gymnasium.spaces.Box(low=low, high=high, dtype=np.float32)
+        obs = self._obs()
+        self.observation_space = gymnasium.spaces.Box(
+            low=-np.inf, high=np.inf, shape=obs.shape, dtype=np.float32
+        )
+        self._steps = 0
+        self._max_steps = int(episode_steps)
+        self._seed = seed
 
-    metrics_summary: dict[str, dict[str, float]] = {}
-    for key, values in metrics_accum.items():
-        arr = np.asarray(values, dtype=np.float64)
-        metrics_summary[key] = {
-            "n": int(arr.size),
-            "mean": float(arr.mean()),
-            "median": float(np.median(arr)),
-            "p05": float(np.quantile(arr, 0.05)),
-            "p95": float(np.quantile(arr, 0.95)),
-            "min": float(arr.min()),
-            "max": float(arr.max()),
-        }
-    stats = GoalManifoldStats(
-        total_frames=total_frames,
-        total_segments=total_segments,
-        episodes_contributing=episodes_contributing,
-        per_episode=log_episodes,
-        metrics_summary=metrics_summary,
-    )
-    log = {
-        "video": str(video_path),
-        "dataset_dir": str(dataset_dir),
-        "total_frames": total_frames,
-        "total_segments": total_segments,
-        "episodes_contributing": episodes_contributing,
-        "episodes_total": len(paths),
-        "metrics_summary": metrics_summary,
-        "per_episode": log_episodes,
-    }
-    log_path.write_text(json.dumps(log, indent=2))
-    print(
-        f"[goal-manifold] frames={total_frames} segments={total_segments} "
-        f"episodes={episodes_contributing}/{len(paths)} "
-        f"-> {video_path}"
-    )
-    return stats
+    def _obs(self) -> np.ndarray:
+        d = self._env.physics.data
+        return np.concatenate([d.qpos.ravel(), d.qvel.ravel()]).astype(np.float32)
 
+    def reset(self, *, seed: int | None = None, options=None):
+        self._env.reset()
+        self._steps = 0
+        return self._obs(), {}
 
-# ---------------------------------------------------------------------------
-# Oracle CEM with simulator state-restoring rollouts.
-#
-# Used **only** to produce a single "goal demo" trajectory that begins from
-# the env reset pose and reaches a successful state. The N explore
-# episodes that LeWM trains on remain oracle-free; this is the "+1" in the
-# "N + 1" dataset. The algorithm is task-agnostic: tasks inject a
-# ``score_fn`` callable that scores a candidate action sequence by
-# replaying it in a state-restoring oracle env. Everything else (CEM
-# optimisation, episode driver, per-step metric recording) lives here.
-# ---------------------------------------------------------------------------
+    def step(self, action):
+        ts = self._env.step(np.asarray(action, dtype=np.float32))
+        self._steps += 1
+        terminated = bool(ts.last())
+        truncated = (not terminated) and (self._steps >= self._max_steps)
+        return self._obs(), float(ts.reward or 0.0), terminated, truncated, {}
 
-
-# ``score_fn(oracle_env, state0, actions, previous_action) -> float`` — higher is better.
-ScoreFn = Callable[[object, np.ndarray, np.ndarray, np.ndarray], float]
+    def close(self):
+        self._env.close()
 
 
 @dataclass(frozen=True)
-class OracleCEMConfig:
-    plan_horizon: int = 40
-    samples: int = 512
-    topk: int = 64
-    iters: int = 6
-    init_std: float = 0.55
-    min_std: float = 0.06
-    momentum: float = 0.15
+class PerturbedRolloutConfig:
+    """Severity-driven OU-burst perturbed rollout config.
+
+    Every episode draws ``severity ~ Beta(beta_a, beta_b)`` (default
+    Beta(5,2): mean ~0.71, right-skewed) and uses it to scale a single
+    OU-correlated noise burst injected mid-rollout, plus an optional
+    random-action warmup that drops the walker into a fallen pose for the
+    SAC policy to recover from. Reference implementation:
+    ``references/noisy_cem_walker_walk.py:86-95, 343-352``.
+    """
+    n_episodes: int = 128
+    severity_beta_a: float = 5.0
+    severity_beta_b: float = 2.0
+    warmup_steps_max: int = 100
+    push_burst_sigma_max: float = 0.7
+    push_burst_len: int = 12
+    push_burst_window: tuple[int, int] = (60, 200)
+    # Burst always starts at >= warmup_steps + buffer, so even high-severity
+    # episodes give SAC at least this many steps to take over before the
+    # push hits.
+    burst_after_warmup_buffer: int = 10
+    # OU noise correlation timescale (seconds). rho = exp(-dt/tau).
+    ou_tau: float = 0.15
 
 
-def oracle_cem_plan(
-    oracle_env,
-    state0: np.ndarray,
-    low: np.ndarray,
-    high: np.ndarray,
-    init_mean: np.ndarray,
-    previous_action: np.ndarray,
-    rng: np.random.Generator,
-    score_fn: ScoreFn,
-    cfg: OracleCEMConfig,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """Return ``(best_first_action, refined_mean, best_score)``."""
-    action_dim = low.shape[0]
-    mean = init_mean.astype(np.float32).copy()
-    std = np.full_like(mean, cfg.init_std, dtype=np.float32)
-    topk = min(cfg.topk, cfg.samples)
-    best_plan: np.ndarray | None = None
-    best_score = -float("inf")
-    for _ in range(cfg.iters):
-        samples = rng.normal(
-            loc=mean[None],
-            scale=std[None],
-            size=(cfg.samples, cfg.plan_horizon, action_dim),
-        ).astype(np.float32)
-        samples[0] = mean
-        samples = np.clip(samples, low.reshape(1, 1, -1), high.reshape(1, 1, -1))
-        scores = np.empty(samples.shape[0], dtype=np.float32)
-        for i in range(samples.shape[0]):
-            scores[i] = score_fn(oracle_env, state0, samples[i], previous_action)
-        elite_idx = np.argpartition(-scores, topk - 1)[:topk]
-        elites = samples[elite_idx]
-        elite_mean = elites.mean(axis=0).astype(np.float32)
-        elite_std = np.maximum(elites.std(axis=0), cfg.min_std).astype(np.float32)
-        mean = (1.0 - cfg.momentum) * elite_mean + cfg.momentum * mean
-        std = elite_std
-        i_best = int(np.argmax(scores))
-        if float(scores[i_best]) > best_score:
-            best_score = float(scores[i_best])
-            best_plan = samples[i_best].copy()
-    assert best_plan is not None
-    return best_plan[0].astype(np.float32), mean.astype(np.float32), best_score
-
-
-def collect_oracle_goal_demo(
+def train_or_load_sac(
     *,
+    env_fn: Callable[[int], object],
+    episode_steps: int,
+    sac_timesteps: int,
+    seed: int,
+    out_dir: Path,
+    desc: str = "SAC",
+):
+    """Load ``out_dir/sac/policy.zip`` if present, otherwise train and save."""
+    from stable_baselines3 import SAC
+
+    out_dir = Path(out_dir)
+    policy_path = out_dir / "sac" / "policy.zip"
+    if policy_path.exists():
+        print(f"[{desc}] loading cached policy <- {policy_path}")
+        return SAC.load(policy_path)
+    print(f"[{desc}] training SAC for {sac_timesteps} steps...")
+    (out_dir / "sac").mkdir(parents=True, exist_ok=True)
+    train_env = _DmcGymEnv(env_fn, seed, episode_steps)
+    model = SAC("MlpPolicy", train_env, seed=seed, verbose=0)
+    model.learn(total_timesteps=int(sac_timesteps), progress_bar=True)
+    model.save(policy_path.with_suffix(""))  # SAC.save appends ".zip"
+    train_env.close()
+    return model
+
+
+def rollout_sac_episode(
+    *,
+    model,
     env_fn: Callable[[int], object],
     action_bounds_fn: Callable[[object], tuple[np.ndarray, np.ndarray]],
     render_fn: Callable[[object], np.ndarray],
     record_fn: Callable[[object], dict[str, float]],
-    score_fn: ScoreFn,
+    control_timestep: float,
     episode_steps: int,
     seed: int,
-    cfg: OracleCEMConfig = OracleCEMConfig(),
+    rng: np.random.Generator,
+    random_warmup_steps: int = 0,
+    push_burst_start: int = 0,
+    push_burst_len: int = 0,
+    push_burst_sigma: float = 0.0,
+    ou_tau: float = 0.15,
     domain: str = "",
     task: str = "",
-    desc: str = "oracle goal",
+    kind: str = "sac_rollout",
+    severity: float | None = None,
 ) -> dict[str, np.ndarray]:
-    """Run one episode under oracle CEM and return the recorded arrays.
+    """One SAC-driven episode with optional warmup + OU-correlated burst.
 
-    The returned dict has the same schema as the explore episodes:
-    ``pixels``, ``actions``, ``rewards``, plus any per-step scalar metrics
-    from ``record_fn`` (e.g. ``torso_height``), and a JSON ``metadata`` blob.
+    Behavior:
+    * For steps ``t < random_warmup_steps``: action is uniform random in
+      ``[low, high]``. Drops the agent into atypical/fallen poses.
+    * For steps ``push_burst_start <= t < push_burst_start + push_burst_len``:
+      action = SAC(obs) + ``push_burst_sigma * eta`` where ``eta`` evolves as
+      ``eta_{t+1} = rho * eta_t + sqrt(1 - rho^2) * N(0, I)`` with
+      ``rho = exp(-dt/ou_tau)``. ``eta`` is reset to 0 at burst onset.
+      OU correlation makes the burst feel like a sustained push rather
+      than canceled white noise.
+    * All other steps: deterministic SAC policy.
+
+    NPZ schema matches what ``collect_dataset`` used to produce.
     """
-    rng = np.random.default_rng(seed)
     env = env_fn(seed)
-    oracle_env = env_fn(seed + 10_000)
+    env.reset()
     low, high = action_bounds_fn(env)
     action_dim = int(low.shape[0])
-    env.reset()
-    plan_mean = np.zeros((cfg.plan_horizon, action_dim), dtype=np.float32)
-    previous_action = np.zeros(action_dim, dtype=np.float32)
+
+    ou_rho = float(np.exp(-control_timestep / ou_tau)) if ou_tau > 0 else 0.0
+    ou_scale = float(np.sqrt(max(1.0 - ou_rho * ou_rho, 0.0)))
+    eta = np.zeros(action_dim, dtype=np.float32)
 
     pixels = [render_fn(env)]
     actions: list[np.ndarray] = []
     rewards: list[float] = []
     metrics_acc: dict[str, list[float]] = {}
 
-    from tqdm import tqdm  # local import to avoid leaking into module-level api.
-
-    bar = tqdm(range(episode_steps), desc=desc, dynamic_ncols=True)
-    for _step in bar:
-        state0 = env.physics.get_state().copy()
-        action, plan_mean, _score = oracle_cem_plan(
-            oracle_env, state0, low, high, plan_mean, previous_action, rng, score_fn, cfg
-        )
-        plan_mean = np.concatenate(
-            [plan_mean[1:], np.zeros((1, action_dim), dtype=np.float32)],
-            axis=0,
-        )
+    for t in range(episode_steps):
+        if t < random_warmup_steps:
+            action = rng.uniform(low, high).astype(np.float32)
+        else:
+            obs = np.concatenate(
+                [env.physics.data.qpos.ravel(), env.physics.data.qvel.ravel()]
+            ).astype(np.float32)
+            predicted, _ = model.predict(obs, deterministic=True)
+            sac_action = predicted.astype(np.float32)
+            in_burst = (
+                push_burst_len > 0
+                and push_burst_sigma > 0
+                and push_burst_start <= t < push_burst_start + push_burst_len
+            )
+            if in_burst:
+                if t == push_burst_start:
+                    eta[:] = 0.0
+                xi = rng.standard_normal(action_dim).astype(np.float32)
+                eta = ou_rho * eta + ou_scale * xi
+                action = sac_action + push_burst_sigma * eta
+            else:
+                eta[:] = 0.0
+                action = sac_action
+        action = np.clip(action, low, high).astype(np.float32)
         ts = env.step(action)
-        pixels.append(render_fn(env))
         actions.append(action.copy())
         rewards.append(float(ts.reward or 0.0))
+        pixels.append(render_fn(env))
         for key, value in record_fn(env).items():
             metrics_acc.setdefault(key, []).append(float(value))
-        previous_action = action
-        postfix = {"ret": f"{sum(rewards):.1f}"}
-        latest = {k: v[-1] for k, v in metrics_acc.items() if v}
-        for k, v in latest.items():
-            postfix[k[:8]] = f"{v:.2f}"
-        bar.set_postfix(postfix)
         if ts.last():
             break
-    bar.close()
     env.close()
-    oracle_env.close()
 
     record: dict[str, np.ndarray] = {
         "pixels": np.stack(pixels, axis=0).astype(np.uint8),
@@ -753,14 +672,223 @@ def collect_oracle_goal_demo(
     for key, values in metrics_acc.items():
         record[key] = np.asarray(values, dtype=np.float32)
     record["metadata"] = np.asarray(
-        json.dumps(
-            {
-                "kind": "oracle_goal_demo",
-                "domain": domain,
-                "task": task,
-                "seed": seed,
-                "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
-            }
-        )
+        json.dumps({
+            "kind": kind,
+            "domain": domain,
+            "task": task,
+            "seed": int(seed),
+            "severity": float(severity) if severity is not None else None,
+            "random_warmup_steps": int(random_warmup_steps),
+            "push_burst_start": int(push_burst_start),
+            "push_burst_len": int(push_burst_len),
+            "push_burst_sigma": float(push_burst_sigma),
+            "ou_tau": float(ou_tau),
+            "ou_rho": float(ou_rho),
+            "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
+        })
     )
     return record
+
+
+def collect_sac_perturbed_dataset(
+    *,
+    env_fn: Callable[[int], object],
+    action_bounds_fn: Callable[[object], tuple[np.ndarray, np.ndarray]],
+    render_fn: Callable[[object], np.ndarray],
+    record_fn: Callable[[object], dict[str, float]],
+    control_timestep: float,
+    episode_steps: int,
+    seed: int,
+    out_dir: Path,
+    dataset_dir: Path,
+    sac_timesteps: int,
+    cfg: PerturbedRolloutConfig,
+    domain: str = "",
+    task: str = "",
+) -> dict:
+    """Train (or load cached) SAC then roll ``cfg.n_episodes`` perturbed
+    episodes. Per-episode: draw ``severity ~ Beta(beta_a, beta_b)`` and use
+    it to scale warmup length and OU-burst sigma; burst start is uniform
+    over ``[warmup_steps + burst_after_warmup_buffer, push_burst_window[1])``
+    so the burst always lands after the SAC policy has taken over.
+
+    All episodes are stacked into a single ``perturbed.npz`` (batch
+    shape ``(N, T+1, H, W, 3)`` for pixels, ``(N, T, A)`` for actions,
+    etc). Progress is displayed with a rich progress bar matching the
+    SAC training bar's style.
+    """
+    from rich.progress import (
+        BarColumn, MofNCompleteColumn, Progress, TextColumn,
+        TimeElapsedColumn, TimeRemainingColumn,
+    )
+
+    dataset_dir = Path(dataset_dir)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    model = train_or_load_sac(
+        env_fn=env_fn,
+        episode_steps=episode_steps,
+        sac_timesteps=sac_timesteps,
+        seed=seed,
+        out_dir=out_dir,
+        desc=f"SAC[{task or 'task'}]",
+    )
+
+    rng = np.random.default_rng(seed)
+    _, burst_hi = cfg.push_burst_window
+    burst_hi_cap = max(1, min(burst_hi, episode_steps - cfg.push_burst_len - 1))
+
+    pixels_list: list[np.ndarray] = []
+    actions_list: list[np.ndarray] = []
+    rewards_list: list[np.ndarray] = []
+    metric_lists: dict[str, list[np.ndarray]] = {}
+    summaries: list[dict] = []
+
+    progress = Progress(
+        TextColumn(f"[bold cyan]perturbed[{task or 'task'}][/bold cyan]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("<"),
+        TimeRemainingColumn(),
+        TextColumn("[dim]• {task.fields[ep_info]}[/dim]"),
+    )
+    with progress:
+        task_id = progress.add_task("rollout", total=cfg.n_episodes, ep_info="")
+        for i in range(cfg.n_episodes):
+            severity = float(rng.beta(cfg.severity_beta_a, cfg.severity_beta_b))
+            warmup = int(round(severity * severity * cfg.warmup_steps_max))
+            burst_sigma = severity * cfg.push_burst_sigma_max
+            burst_lo_eff = max(warmup + cfg.burst_after_warmup_buffer, 0)
+            burst_lo_eff = min(burst_lo_eff, burst_hi_cap - 1)
+            burst_start = int(rng.integers(burst_lo_eff, burst_hi_cap))
+
+            ep = rollout_sac_episode(
+                model=model,
+                env_fn=env_fn,
+                action_bounds_fn=action_bounds_fn,
+                render_fn=render_fn,
+                record_fn=record_fn,
+                control_timestep=control_timestep,
+                episode_steps=episode_steps,
+                seed=seed + 1 + i,
+                rng=rng,
+                random_warmup_steps=warmup,
+                push_burst_start=burst_start,
+                push_burst_len=cfg.push_burst_len,
+                push_burst_sigma=float(burst_sigma),
+                ou_tau=cfg.ou_tau,
+                domain=domain,
+                task=task,
+                kind="sac_perturbed",
+                severity=severity,
+            )
+
+            pixels_list.append(ep["pixels"])
+            actions_list.append(ep["actions"])
+            rewards_list.append(ep["rewards"])
+            for k, v in ep.items():
+                if k in ("pixels", "actions", "rewards", "metadata"):
+                    continue
+                metric_lists.setdefault(k, []).append(np.asarray(v, dtype=np.float32))
+
+            ep_return = float(ep["rewards"].sum())
+            summaries.append({
+                "ep_idx": i,
+                "severity": severity,
+                "random_warmup_steps": warmup,
+                "push_burst_start": burst_start,
+                "push_burst_len": cfg.push_burst_len,
+                "push_burst_sigma": float(burst_sigma),
+                "return": ep_return,
+                "mean_reward": float(ep["rewards"].mean()) if ep["rewards"].size else 0.0,
+                "length": int(ep["rewards"].size),
+            })
+            progress.update(
+                task_id, advance=1,
+                ep_info=f"sev={severity:.2f} return={ep_return:6.1f}",
+            )
+
+    pixels = np.stack(pixels_list, axis=0)
+    actions = np.stack(actions_list, axis=0)
+    rewards = np.stack(rewards_list, axis=0)
+    batched: dict[str, np.ndarray] = {
+        "pixels": pixels, "actions": actions, "rewards": rewards,
+    }
+    for k, vs in metric_lists.items():
+        batched[k] = np.stack(vs, axis=0)
+    batched["severity"] = np.asarray(
+        [s["severity"] for s in summaries], dtype=np.float32
+    )
+    batched["random_warmup_steps"] = np.asarray(
+        [s["random_warmup_steps"] for s in summaries], dtype=np.int32
+    )
+    batched["push_burst_start"] = np.asarray(
+        [s["push_burst_start"] for s in summaries], dtype=np.int32
+    )
+    batched["push_burst_sigma"] = np.asarray(
+        [s["push_burst_sigma"] for s in summaries], dtype=np.float32
+    )
+
+    config = {
+        "n_episodes": cfg.n_episodes,
+        "severity_beta_a": cfg.severity_beta_a,
+        "severity_beta_b": cfg.severity_beta_b,
+        "warmup_steps_max": cfg.warmup_steps_max,
+        "push_burst_sigma_max": cfg.push_burst_sigma_max,
+        "push_burst_len": cfg.push_burst_len,
+        "push_burst_window": list(cfg.push_burst_window),
+        "burst_after_warmup_buffer": cfg.burst_after_warmup_buffer,
+        "ou_tau": cfg.ou_tau,
+        "episode_steps": int(episode_steps),
+        "control_timestep": float(control_timestep),
+        "seed": int(seed),
+        "sac_timesteps": int(sac_timesteps),
+    }
+    batched["metadata"] = np.asarray(json.dumps({
+        "kind": "sac_perturbed_dataset",
+        "domain": domain, "task": task, "config": config,
+        "episodes": summaries,
+        "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
+    }))
+    np.savez_compressed(dataset_dir / "perturbed.npz", **batched)
+
+    return {"episodes": summaries, "config": config}
+
+
+def collect_sac_goal_demo(
+    *,
+    model,
+    env_fn: Callable[[int], object],
+    action_bounds_fn: Callable[[object], tuple[np.ndarray, np.ndarray]],
+    render_fn: Callable[[object], np.ndarray],
+    record_fn: Callable[[object], dict[str, float]],
+    control_timestep: float,
+    episode_steps: int,
+    seed: int,
+    domain: str = "",
+    task: str = "",
+) -> dict[str, np.ndarray]:
+    """Single deterministic SAC rollout from env reset. The model is passed
+    in (typically produced by ``train_or_load_sac`` upstream so the cached
+    policy is reused). No perturbation — pure SAC policy."""
+    rng = np.random.default_rng(seed)
+    return rollout_sac_episode(
+        model=model,
+        env_fn=env_fn,
+        action_bounds_fn=action_bounds_fn,
+        render_fn=render_fn,
+        control_timestep=control_timestep,
+        record_fn=record_fn,
+        episode_steps=episode_steps,
+        seed=seed,
+        rng=rng,
+        random_warmup_steps=0,
+        push_burst_start=0,
+        push_burst_len=0,
+        push_burst_sigma=0.0,
+        domain=domain,
+        task=task,
+        kind="sac_goal_demo",
+    )

@@ -1,23 +1,13 @@
 """LeWM-CEM pipeline for dm_control walker/walk.
 
-One-shot entrypoint:
-
+Run:
     uv run python tasks/walker_walk.py
 
-This adapter contributes only the *task-specific* parts (env creation,
-rendering, per-step diagnostics, frame-quality thresholds, oracle reward
-shaping). Dataset collection, oracle-CEM goal demo, LeWM training, and
-CEM evaluation all live in ``src/``.
-
-Pipeline:
-1. ``src.datasets.collect_dataset`` writes ``DATASET_N_EPISODES`` explore
-   episodes under ``DATASET_DIR``.
-2. ``src.datasets.collect_oracle_goal_demo`` adds 1 oracle-CEM demo
-   that starts from the env reset pose and walks forward — used purely
-   as the planner's goal trajectory.
-3. ``src.lewm.train_lewm`` trains a LeWM-pure model (adaln_id init).
-4. ``src.eval.evaluate_lewm_cem`` runs the CEM eval and writes
-   ``metrics.json`` + ``eval_cam.mp4``.
+Pipeline (everything generic lives in ``src/``):
+1. ``datasets.collect_dataset`` writes ``DATASET_N_EPISODES`` explore episodes.
+2. ``datasets.collect_sac_goal_demo`` trains SB3 SAC and rolls one demo.
+3. ``lewm.train_lewm`` trains a LeWM-pure model (adaln_id init).
+4. ``eval.evaluate_lewm_cem`` runs the CEM eval.
 """
 
 from __future__ import annotations
@@ -27,7 +17,6 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Iterable
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -36,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import imageio.v2 as imageio
 import numpy as np
 import torch
 from dm_control import suite
@@ -48,7 +38,6 @@ from src.planner import PlannerWeights
 # Identity and paths.
 # ---------------------------------------------------------------------------
 
-
 DOMAIN = "walker"
 TASK = "walk"
 SEED = 42
@@ -57,13 +46,12 @@ DATASET_DIR = Path("datasets/walker_walk")
 OUT_DIR = Path("outputs/walker_walk")
 CKPT_DIR = OUT_DIR / "ckpt"
 TRAIN_LOG_PATH = OUT_DIR / "train_log.jsonl"
-DATASET_VERSION = 7  # 128 explore + 1 oracle goal demo (E7).
+DATASET_VERSION = 11  # bumped: single perturbed.npz; burst after warmup; no goal_manifold viz.
 
 
 # ---------------------------------------------------------------------------
 # Rendering / dataset collection.
 # ---------------------------------------------------------------------------
-
 
 IMAGE_SIZE = 112
 DATASET_CAMERA_ID = 0
@@ -71,48 +59,25 @@ VIDEO_CAMERA_ID = 0
 VIDEO_WIDTH = 640
 VIDEO_HEIGHT = 480
 VIDEO_FPS = 40
-DT = 0.025  # dm_control walker step length (40 Hz).
+DT = 0.025  # dm_control walker control_timestep (40 Hz).
 
 DATASET_N_EPISODES = 128
 DATASET_EPISODE_STEPS = 400
-DATASET_WORKERS = min(8, os.cpu_count() or 1)
-DATASET_MP_START_METHOD = "forkserver"
-
-
-# ---------------------------------------------------------------------------
-# Goal- and fall-frame thresholds (drive the post-hoc goal manifold).
-# ---------------------------------------------------------------------------
-
-
-GOAL_FRAME_MIN_REWARD = 0.0
-GOAL_FRAME_MIN_HEIGHT = 0.9
-GOAL_FRAME_MIN_UPRIGHT = 0.5
-GOAL_FRAME_MIN_VELOCITY = 0.1
-GOAL_MIN_SEGMENT_LEN = 4
-
-SUPPORT_FRAME_MAX_HEIGHT = 0.7
-SUPPORT_FRAME_MAX_UPRIGHT = 0.3
-
-
-# ---------------------------------------------------------------------------
-# Oracle CEM reward shaping (walker: forward speed + upright posture).
-# ---------------------------------------------------------------------------
-
-
-ORACLE_TARGET_SPEED = 1.2
-ORACLE_PROGRESS_BONUS = 0.75
-ORACLE_SPEED_TRACKING_BONUS = 0.12
-ORACLE_OVERSPEED_PENALTY = 0.35
-ORACLE_POSTURE_PENALTY = 1.2
-ORACLE_ACTION_PENALTY = 0.01
-ORACLE_ACTION_SMOOTHNESS_PENALTY = 0.015
-ORACLE_REWARD_GAMMA = 0.98
+# Severity ~ Beta(a, b). Default (5, 2): mean 0.714, right-skewed —
+# most episodes get strong perturbation, light wobbles are rare.
+DATASET_SEVERITY_BETA_A = 5.0
+DATASET_SEVERITY_BETA_B = 2.0
+DATASET_WARMUP_STEPS_MAX = 100
+DATASET_PUSH_BURST_SIGMA_MAX = 0.7
+DATASET_PUSH_BURST_LEN = 12
+DATASET_PUSH_BURST_WINDOW = (60, 200)
+DATASET_OU_TAU = 0.15
+SAC_TIMESTEPS = 1_000_000
 
 
 # ---------------------------------------------------------------------------
 # LeWM training.
 # ---------------------------------------------------------------------------
-
 
 HISTORY_SIZE = 4
 NUM_PREDS = 1
@@ -125,7 +90,7 @@ PREDICTOR_HEADS = 16
 PREDICTOR_DIM_HEAD = 64
 PREDICTOR_MLP_DIM = 2048
 PREDICTOR_DROPOUT = 0.1
-PREDICTOR_CONDITIONING = "adaln_id"  # E4d: nonzero action conditioning at init.
+PREDICTOR_CONDITIONING = "adaln_id"
 
 SIGREG_WEIGHT = 0.07
 SIGREG_KNOTS = 17
@@ -139,16 +104,12 @@ GRAD_CLIP = 1.0
 LOG_EVERY = 50
 TRAIN_ROLLOUT_STEPS = 16
 ROLLOUT_LOSS_WEIGHT = 1.0
-ACTION_CONTRAST_WEIGHT = 0.0  # disabled; ``adaln_id`` alone is enough (E4d-v2).
-ACTION_CONTRAST_MARGIN = 0.0
-ACTION_CONTRAST_HORIZON = 0
-TRAIN_WINDOW_WEIGHTING = False  # E6 follow-up: weighting backfired.
+ACTION_CONTRAST_WEIGHT = 0.0
 
 
 # ---------------------------------------------------------------------------
 # Eval / CEM planner.
 # ---------------------------------------------------------------------------
-
 
 EVAL_STEPS = 400
 EVAL_BOOTSTRAP_STEPS = HISTORY_SIZE - 1
@@ -162,35 +123,25 @@ EVAL_CEM_INIT_STD = 0.01
 EVAL_CEM_MAX_STD = 0.65
 EVAL_CEM_MIN_STD = 0.002
 EVAL_CEM_MOMENTUM = 0.15
-CEM_WARM_START_BLEND = 0.0
-CEM_PRIOR_TIE_REL = 0.0
-CEM_PRIOR_TIE_ABS = 0.0  # E7: guard off, CEM elite wins on cost alone.
+CEM_PRIOR_TIE_ABS = 0.0
 CEM_PRIOR_IN_MEAN = True
 CEM_PRIOR_IN_SAMPLES = True
-CEM_STATE_COST_CLIP = 0.0
-CEM_DELTA_COST_CLIP = 0.0
-CEM_NEAR_COST_CLIP = 0.0
 
 TRAJ_DISCOUNT = 0.92
-NEAR_DELTA_WEIGHT = 0.5
 W_STATE = 0.2
 W_DELTA = 4.0
-W_SUPPORT_STATE = 0.0
-W_SUPPORT_DELTA = 0.0
 W_NEAR = 0.01
 W_ACTION_PRIOR = 0.1
 W_SMOOTH = 0.1
 W_ENERGY = 0.002
 
-SUPPORT_MIN_MASK_FRAMES = PLAN_HORIZON + 1
-MANIFOLD_MAX_STATE_POINTS = 4096
-MANIFOLD_MAX_DELTA_POINTS = 4096
+MANIFOLD_MAX_POINTS = 4096
 MANIFOLD_MAX_SEGMENTS = 4096
 MANIFOLD_COST_SCALE_MIN = 1e-4
 
 
 # ---------------------------------------------------------------------------
-# Helpers (this is all the task-specific code there is).
+# Task callables (the only task-specific code in this file).
 # ---------------------------------------------------------------------------
 
 
@@ -223,19 +174,15 @@ def append_jsonl(path: Path, payload: dict) -> None:
 
 def make_env(seed: int):
     return suite.load(
-        domain_name=DOMAIN,
-        task_name=TASK,
-        task_kwargs={"random": seed},
-        visualize_reward=False,
+        domain_name=DOMAIN, task_name=TASK,
+        task_kwargs={"random": seed}, visualize_reward=False,
     )
 
 
 def action_bounds(env) -> tuple[np.ndarray, np.ndarray]:
     spec = env.action_spec()
-    return (
-        np.asarray(spec.minimum, dtype=np.float32),
-        np.asarray(spec.maximum, dtype=np.float32),
-    )
+    return (np.asarray(spec.minimum, dtype=np.float32),
+            np.asarray(spec.maximum, dtype=np.float32))
 
 
 def render_dataset_frame(env) -> np.ndarray:
@@ -251,9 +198,8 @@ def render_video_frame(env) -> np.ndarray:
 
 
 def diagnostics(env) -> dict[str, float]:
-    """Per-step task metrics — these field names show up verbatim in the
-    eval trace + metrics.json, so they are the contract between this task
-    and any dashboard / analysis script."""
+    """Per-step task metrics — these field names appear verbatim in the
+    eval trace and metrics.json (contract with downstream dashboards)."""
     out = {
         "torso_height": float("nan"),
         "torso_upright": float("nan"),
@@ -268,127 +214,6 @@ def diagnostics(env) -> dict[str, float]:
     except Exception:
         pass
     return out
-
-
-def discounted_sum(rewards: Iterable[float], gamma: float) -> float:
-    total = 0.0
-    discount = 1.0
-    for r in rewards:
-        total += discount * float(r)
-        discount *= gamma
-    return float(total)
-
-
-# ---------------------------------------------------------------------------
-# Frame masks for the post-hoc goal manifold.
-# ---------------------------------------------------------------------------
-
-
-def goal_frame_mask(ep: dict[str, np.ndarray]) -> np.ndarray:
-    """True wherever the walker looks like it is walking."""
-    num_frames = len(ep["pixels"])
-    if num_frames == 0:
-        return np.zeros(0, dtype=bool)
-    action_steps = max(num_frames - 1, 1)
-    metric_ids = np.clip(np.arange(num_frames) - 1, 0, action_steps - 1)
-    mask = np.ones(num_frames, dtype=bool)
-    for key, threshold in (
-        ("rewards", GOAL_FRAME_MIN_REWARD),
-        ("torso_height", GOAL_FRAME_MIN_HEIGHT),
-        ("torso_upright", GOAL_FRAME_MIN_UPRIGHT),
-        ("horizontal_velocity", GOAL_FRAME_MIN_VELOCITY),
-    ):
-        if key in ep:
-            arr = np.asarray(ep[key])
-            mask = mask & (arr[np.clip(metric_ids, 0, len(arr) - 1)] >= threshold)
-    return mask
-
-
-def fall_frame_mask(ep: dict[str, np.ndarray]) -> np.ndarray:
-    """True wherever the walker looks like it is on the ground."""
-    num_frames = len(ep["pixels"])
-    if num_frames == 0:
-        return np.zeros(0, dtype=bool)
-    action_steps = max(num_frames - 1, 1)
-    metric_ids = np.clip(np.arange(num_frames) - 1, 0, action_steps - 1)
-    out = np.zeros(num_frames, dtype=bool)
-    if "torso_height" in ep:
-        h = np.asarray(ep["torso_height"])
-        out = out | (h[np.clip(metric_ids, 0, len(h) - 1)] <= SUPPORT_FRAME_MAX_HEIGHT)
-    if "torso_upright" in ep:
-        u = np.asarray(ep["torso_upright"])
-        out = out | (u[np.clip(metric_ids, 0, len(u) - 1)] <= SUPPORT_FRAME_MAX_UPRIGHT)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Oracle CEM reward shaping for the +1 goal demo. Task-specific.
-# ---------------------------------------------------------------------------
-
-
-def oracle_score_fn(
-    oracle_env,
-    state0: np.ndarray,
-    actions: np.ndarray,
-    previous_action: np.ndarray,
-) -> float:
-    oracle_env.reset()
-    oracle_env.physics.set_state(state0)
-    oracle_env.physics.forward()
-    start_x = float(oracle_env.physics.named.data.xpos["torso", "x"])
-    rewards: list[float] = []
-    last_action = previous_action
-    smooth_cost = speed_tracking = overspeed_cost = posture_cost = 0.0
-    for action in actions:
-        ts = oracle_env.step(action.astype(np.float32))
-        velocity = float(oracle_env.physics.horizontal_velocity())
-        height = float(oracle_env.physics.torso_height())
-        upright = float(oracle_env.physics.torso_upright())
-        rewards.append(float(ts.reward or 0.0))
-        smooth_cost += float(np.mean((action - last_action) ** 2))
-        speed_tracking += float(np.exp(-((velocity - ORACLE_TARGET_SPEED) ** 2) / 0.5))
-        overspeed_cost += max(velocity - 1.8, 0.0) ** 2
-        posture_cost += max(1.0 - height, 0.0) ** 2 + max(0.75 - upright, 0.0) ** 2
-        last_action = action
-        if ts.last():
-            break
-    final_x = float(oracle_env.physics.named.data.xpos["torso", "x"])
-    progress = max(final_x - start_x, 0.0)
-    n = max(len(rewards), 1)
-    return (
-        discounted_sum(rewards, ORACLE_REWARD_GAMMA)
-        + ORACLE_PROGRESS_BONUS * progress
-        + ORACLE_SPEED_TRACKING_BONUS * (speed_tracking / n)
-        - ORACLE_OVERSPEED_PENALTY * (overspeed_cost / n)
-        - ORACLE_POSTURE_PENALTY * (posture_cost / n)
-        - ORACLE_ACTION_PENALTY * float(np.mean(actions**2))
-        - ORACLE_ACTION_SMOOTHNESS_PENALTY * smooth_cost
-    )
-
-
-def walker_window_weight(ep: dict[str, np.ndarray], start: int, window_pixels: int) -> float:
-    """Optional training sampler bias toward "upright + moving" windows.
-    Disabled by default (E6: weighting hurt action Jacobian)."""
-    end = min(start + window_pixels - 1, len(ep["pixels"]) - 1)
-    metric_start = max(start - 1, 0)
-    metric_end = max(end - 1, metric_start + 1)
-    weight = 1.0
-    if "torso_height" in ep and "torso_upright" in ep:
-        h = np.asarray(ep["torso_height"][metric_start:metric_end], dtype=np.float32)
-        u = np.asarray(ep["torso_upright"][metric_start:metric_end], dtype=np.float32)
-        if h.size and u.size:
-            weight += 6.0 * float(np.clip(h.mean(), 0.0, 1.4) * np.clip(np.abs(u).mean(), 0.0, 1.0))
-    if "rewards" in ep:
-        r = np.asarray(ep["rewards"][metric_start:metric_end], dtype=np.float32)
-        if r.size:
-            weight += 4.0 * float(np.clip(r.mean(), 0.0, 1.0))
-    return weight
-
-
-# ---------------------------------------------------------------------------
-# Register task handles with src.datasets so explore-episode workers
-# (forkserver, no closures) can re-import this module and find them.
-# ---------------------------------------------------------------------------
 
 
 datasets.register_task(
@@ -412,7 +237,7 @@ def dataset_ready() -> bool:
     if not (
         DATASET_DIR.exists()
         and (DATASET_DIR / "goal_trajectory.npz").exists()
-        and bool(list(DATASET_DIR.glob("episode_*.npz")))
+        and (DATASET_DIR / "perturbed.npz").exists()
     ):
         return False
     metadata_path = DATASET_DIR / "metadata.json"
@@ -426,91 +251,119 @@ def dataset_ready() -> bool:
 
 
 def build_static_dataset() -> None:
-    """Collect 128 explore episodes + 1 oracle-CEM goal demo."""
+    """Collect 128 SAC-perturbed rollouts + 1 deterministic SAC goal demo."""
     if dataset_ready():
         print(f"[data] using existing dataset -> {DATASET_DIR}")
         return
 
-    print(f"[data] creating dataset -> {DATASET_DIR} (128 explore + 1 oracle)")
+    print(f"[data] creating dataset -> {DATASET_DIR} ({DATASET_N_EPISODES} SAC-perturbed + 1 goal demo)")
     if DATASET_DIR.exists():
         shutil.rmtree(DATASET_DIR)
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
-    collect_metadata = datasets.collect_dataset(
-        out_dir=DATASET_DIR,
-        task_name="walker_walk",
-        task_module="tasks.walker_walk",
-        config=datasets.CollectConfig(
-            n_episodes=DATASET_N_EPISODES,
-            episode_steps=DATASET_EPISODE_STEPS,
-            workers=DATASET_WORKERS,
-            seed=SEED,
-            mp_start_method=DATASET_MP_START_METHOD,
-        ),
+    model = datasets.train_or_load_sac(
+        env_fn=make_env,
+        episode_steps=DATASET_EPISODE_STEPS,
+        sac_timesteps=SAC_TIMESTEPS,
+        seed=SEED,
+        out_dir=OUT_DIR,
+        desc=f"SAC[{TASK}]",
     )
 
-    print("[data] collecting 1 oracle-CEM goal demo...")
-    oracle_demo = datasets.collect_oracle_goal_demo(
+    collect_metadata = datasets.collect_sac_perturbed_dataset(
         env_fn=make_env,
         action_bounds_fn=action_bounds,
         render_fn=render_dataset_frame,
         record_fn=diagnostics,
-        score_fn=oracle_score_fn,
+        control_timestep=DT,
+        episode_steps=DATASET_EPISODE_STEPS,
+        seed=SEED,
+        out_dir=OUT_DIR,
+        dataset_dir=DATASET_DIR,
+        sac_timesteps=SAC_TIMESTEPS,
+        cfg=datasets.PerturbedRolloutConfig(
+            n_episodes=DATASET_N_EPISODES,
+            severity_beta_a=DATASET_SEVERITY_BETA_A,
+            severity_beta_b=DATASET_SEVERITY_BETA_B,
+            warmup_steps_max=DATASET_WARMUP_STEPS_MAX,
+            push_burst_sigma_max=DATASET_PUSH_BURST_SIGMA_MAX,
+            push_burst_len=DATASET_PUSH_BURST_LEN,
+            push_burst_window=DATASET_PUSH_BURST_WINDOW,
+            ou_tau=DATASET_OU_TAU,
+        ),
+        domain=DOMAIN,
+        task=TASK,
+    )
+
+    sac_demo = datasets.collect_sac_goal_demo(
+        model=model,
+        env_fn=make_env,
+        action_bounds_fn=action_bounds,
+        render_fn=render_dataset_frame,
+        record_fn=diagnostics,
+        control_timestep=DT,
         episode_steps=DATASET_EPISODE_STEPS,
         seed=SEED,
         domain=DOMAIN,
         task=TASK,
     )
-    oracle_path = DATASET_DIR / f"episode_{DATASET_N_EPISODES:04d}.npz"
-    np.savez_compressed(oracle_path, **oracle_demo)
-    print(
-        f"[data] oracle demo: return={float(oracle_demo['rewards'].sum()):.1f} "
-        f"-> {oracle_path.name}"
-    )
-
-    # The oracle demo IS the goal trajectory (first frame matches env reset).
-    goal_traj = dict(oracle_demo)
-    goal_traj["metadata"] = np.asarray(
-        json.dumps(
-            {
-                "source": "oracle_goal_demo",
-                "total_pixels": int(oracle_demo["pixels"].shape[0]),
-                "total_actions": int(oracle_demo["actions"].shape[0]),
-                "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
-            }
-        )
-    )
+    sac_return = float(sac_demo["rewards"].sum())
+    goal_traj = dict(sac_demo)
+    goal_traj["metadata"] = np.asarray(json.dumps({
+        "source": "sac_goal_demo",
+        "return": sac_return,
+        "action_semantics": "actions[t] advances pixels[t] to pixels[t+1]",
+    }))
     np.savez_compressed(DATASET_DIR / "goal_trajectory.npz", **goal_traj)
+    print(f"[data] SAC goal demo: return={sac_return:.1f} -> goal_trajectory.npz")
 
-    print("[data] rendering goal_manifold.mp4 from all goal frames...")
-    stats = datasets.render_goal_manifold(
-        dataset_dir=DATASET_DIR,
-        out_dir=DATASET_DIR,
-        goal_mask_fn=goal_frame_mask,
-        video_fps=VIDEO_FPS,
-        min_segment_len=GOAL_MIN_SEGMENT_LEN,
-    )
+    render_perturbed_samples(model, collect_metadata["episodes"])
 
-    write_json(
-        DATASET_DIR / "metadata.json",
-        {
-            "dataset_version": DATASET_VERSION,
-            "config": hparams(),
-            "collect_config": collect_metadata["config"],
-            "episodes": collect_metadata["episodes"],
-            "goal_manifold_stats": {
-                "total_frames": stats.total_frames,
-                "total_segments": stats.total_segments,
-                "episodes_contributing": stats.episodes_contributing,
-                "metrics_summary": stats.metrics_summary,
-            },
-        },
-    )
-    print(
-        f"[data] dataset built: {len(collect_metadata['episodes'])} explore + 1 oracle, "
-        f"goal_manifold {stats.total_frames} frames across "
-        f"{stats.episodes_contributing} episodes"
-    )
+    write_json(DATASET_DIR / "metadata.json", {
+        "dataset_version": DATASET_VERSION,
+        "config": hparams(),
+        "collect_config": collect_metadata["config"],
+        "episodes": collect_metadata["episodes"],
+        "goal_return": sac_return,
+    })
+    print(f"[data] dataset ready: 1 goal demo + {DATASET_N_EPISODES} perturbed -> {DATASET_DIR}")
+
+
+def render_perturbed_samples(model, episodes: list[dict]) -> None:
+    """Re-roll 2 representative perturbed episodes (max severity + median
+    severity) at video resolution and write mp4s for eyeballing."""
+    if not episodes:
+        return
+    sorted_by_sev = sorted(episodes, key=lambda e: e["severity"])
+    picks = [
+        ("high_severity", sorted_by_sev[-1]),
+        ("mid_severity", sorted_by_sev[len(sorted_by_sev) // 2]),
+    ]
+    for label, ep_meta in picks:
+        rng = np.random.default_rng(SEED + 1 + ep_meta["ep_idx"])
+        ep = datasets.rollout_sac_episode(
+            model=model,
+            env_fn=make_env,
+            action_bounds_fn=action_bounds,
+            render_fn=render_video_frame,
+            record_fn=diagnostics,
+            control_timestep=DT,
+            episode_steps=DATASET_EPISODE_STEPS,
+            seed=SEED + 1 + ep_meta["ep_idx"],
+            rng=rng,
+            random_warmup_steps=ep_meta["random_warmup_steps"],
+            push_burst_start=ep_meta["push_burst_start"],
+            push_burst_len=ep_meta["push_burst_len"],
+            push_burst_sigma=ep_meta["push_burst_sigma"],
+            ou_tau=DATASET_OU_TAU,
+            domain=DOMAIN,
+            task=TASK,
+            kind="sac_perturbed_viz",
+            severity=ep_meta["severity"],
+        )
+        mp4 = OUT_DIR / f"perturbed_{label}.mp4"
+        imageio.mimsave(mp4, list(ep["pixels"]), fps=VIDEO_FPS)
+        print(f"[viz] {label} (sev={ep_meta['severity']:.2f}, return={float(ep['rewards'].sum()):.1f}) -> {mp4}")
 
 
 def model_config(action_dim: int) -> lewm.LeWMModelConfig:
@@ -540,8 +393,6 @@ def train_config() -> lewm.LeWMTrainConfig:
         sigreg_knots=SIGREG_KNOTS,
         sigreg_num_proj=SIGREG_NUM_PROJ,
         action_contrast_weight=ACTION_CONTRAST_WEIGHT,
-        action_contrast_margin=ACTION_CONTRAST_MARGIN,
-        action_contrast_horizon=ACTION_CONTRAST_HORIZON,
         batch_size=TRAIN_BATCH_SIZE,
         train_steps=TRAIN_STEPS,
         num_workers=TRAIN_NUM_WORKERS,
@@ -553,8 +404,8 @@ def train_config() -> lewm.LeWMTrainConfig:
 
 
 def train_lewm() -> tuple[Path, int]:
-    with np.load(next(iter(sorted(DATASET_DIR.glob("episode_*.npz"))))) as ep:
-        action_dim = int(ep["actions"].shape[1])
+    with np.load(DATASET_DIR / "perturbed.npz") as ds:
+        action_dim = int(ds["actions"].shape[-1])
     return lewm.train_lewm(
         dataset_dir=DATASET_DIR,
         ckpt_path=CKPT_DIR / "lewm.pt",
@@ -563,7 +414,7 @@ def train_lewm() -> tuple[Path, int]:
         train_cfg=train_config(),
         hparams=hparams(),
         append_jsonl=append_jsonl,
-        window_weight_fn=walker_window_weight if TRAIN_WINDOW_WEIGHTING else None,
+        window_weight_fn=None,
     )
 
 
@@ -587,15 +438,9 @@ def eval_config() -> eval_module.EvalConfig:
         min_std=EVAL_CEM_MIN_STD,
         max_std=EVAL_CEM_MAX_STD,
         momentum=EVAL_CEM_MOMENTUM,
-        warm_start_blend=CEM_WARM_START_BLEND,
-        prior_tie_rel=CEM_PRIOR_TIE_REL,
         prior_tie_abs=CEM_PRIOR_TIE_ABS,
         prior_in_mean=CEM_PRIOR_IN_MEAN,
         prior_in_samples=CEM_PRIOR_IN_SAMPLES,
-        state_cost_clip=CEM_STATE_COST_CLIP,
-        delta_cost_clip=CEM_DELTA_COST_CLIP,
-        near_cost_clip=CEM_NEAR_COST_CLIP,
-        near_delta_weight=NEAR_DELTA_WEIGHT,
         cost_scale_min=MANIFOLD_COST_SCALE_MIN,
         traj_discount=TRAJ_DISCOUNT,
         video_fps=VIDEO_FPS,
@@ -604,14 +449,8 @@ def eval_config() -> eval_module.EvalConfig:
 
 def planner_weights() -> PlannerWeights:
     return PlannerWeights(
-        state=W_STATE,
-        delta=W_DELTA,
-        support_state=W_SUPPORT_STATE,
-        support_delta=W_SUPPORT_DELTA,
-        near=W_NEAR,
-        action_prior=W_ACTION_PRIOR,
-        smooth=W_SMOOTH,
-        energy=W_ENERGY,
+        state=W_STATE, delta=W_DELTA, near=W_NEAR,
+        action_prior=W_ACTION_PRIOR, smooth=W_SMOOTH, energy=W_ENERGY,
     )
 
 
@@ -629,10 +468,7 @@ def evaluate_lewm_cem(ckpt_path: Path, action_dim: int) -> dict:
         render_video_fn=render_video_frame,
         record_fn=diagnostics,
         preprocess_pixels_fn=preprocess_pixels,
-        goal_frame_mask_fn=goal_frame_mask,
-        fall_frame_mask_fn=fall_frame_mask,
-        manifold_min_mask_frames=SUPPORT_MIN_MASK_FRAMES,
-        manifold_max_points=MANIFOLD_MAX_STATE_POINTS,
+        manifold_max_points=MANIFOLD_MAX_POINTS,
         manifold_max_segments=MANIFOLD_MAX_SEGMENTS,
         extra_metrics={"config": hparams()},
         domain=DOMAIN,
